@@ -1,0 +1,10 @@
+{
+  "name": "Theory Test Seat Simulator",
+  "short_name": "Seat Simulator",
+  "description": "Interactive booking simulation tool for theory test seats",
+  "start_url": "/booking-test-simulation/",
+  "display": "browser",
+  "background_color": "#ffffff",
+  "theme_color": "#0E5B4A",
+  "orientation": "portrait-primary"
+}

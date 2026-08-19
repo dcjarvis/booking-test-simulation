@@ -1,345 +1,373 @@
-import { useMemo, useState } from "react";
-
-// ---------- model ----------
-const INTERVALS = 16; // 09:00–17:00 in 30-min steps
-const TRIALS = 200;
-
-const timeLabel = (i) => {
-  const h = 9 + Math.floor(i / 2);
-  return `${h}:${i % 2 ? "30" : "00"}`;
-};
-
-function mulberry32(a) {
-  return function () {
-    a |= 0; a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function shuffle(arr, rand) {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-  }
-}
-
-// preference weights over start intervals: uniform blended with mid-morning + mid-afternoon peaks
-function prefWeights(maxStart, peakBias) {
-  const b = peakBias / 100;
-  const w = [];
-  for (let i = 0; i <= maxStart; i++) {
-    const peaks = Math.exp(-((i - 3) ** 2) / 6) + 0.8 * Math.exp(-((i - 10) ** 2) / 6);
-    w.push((1 - b) * 1 + b * 2.2 * peaks);
-  }
-  return w;
-}
-
-function sampleIdx(weights, rand) {
-  const total = weights.reduce((a, c) => a + c, 0);
-  let r = rand() * total;
-  for (let i = 0; i < weights.length; i++) {
-    r -= weights[i];
-    if (r <= 0) return i;
-  }
-  return weights.length - 1;
-}
-
-function runTrial(p, rand) {
-  const occ = new Array(INTERVALS).fill(0);
-  const n = p.demand;
-
-  const customers = [];
-  for (let k = 0; k < n; k++) {
-    customers.push({
-      dur: rand() < p.twoHourShare / 100 ? 4 : 2, // in intervals
-      flexible: rand() < p.lastMinuteShare / 100,
-    });
-  }
-  // planners book ahead, so they hit an emptier book; last-minute arrivals come after
-  const planners = customers.filter((c) => !c.flexible);
-  const flex = customers.filter((c) => c.flexible);
-  shuffle(planners, rand);
-  shuffle(flex, rand);
-  const ordered = [...planners, ...flex];
-
-  const weightsCache = {};
-  const validStarts = (dur) => {
-    const out = [];
-    for (let s = 0; s <= INTERVALS - dur; s++) {
-      if (dur === 4 && p.hourAlign && s % 2 !== 0) continue;
-      out.push(s);
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Theory test seat simulator - Interactive booking simulation tool">
+  <meta name="theme-color" content="#0E5B4A">
+  <title>Theory Test Seat Simulator</title>
+  
+  <!-- App Icon -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'><rect fill='%230E5B4A' width='180' height='180'/><text x='90' y='100' font-size='80' font-weight='bold' fill='white' text-anchor='middle' dy='.3em'>T</text></svg>">
+  
+  <!-- React from CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  
+  <style>
+    * { box-sizing: border-box; margin: 0; }
+    body {
+      font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #EEF1F0;
+      color: #172422;
     }
-    return out;
-  };
-  const startsCache = { 2: validStarts(2), 4: validStarts(4) };
+  </style>
+</head>
+<body>
+  <div id="root"></div>
 
-  const req = { 2: 0, 4: 0 };
-  const rej = { 2: 0, 4: 0 };
+  <script type="text/babel">
+    const { useMemo, useState } = React;
 
-  for (const c of ordered) {
-    req[c.dur]++;
-    const cap = c.dur === 2 ? p.seats - p.reserve : p.seats;
-    const maxStart = INTERVALS - c.dur;
-    if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
-    const pref = sampleIdx(weightsCache[c.dur], rand);
+    const INTERVALS = 16;
+    const TRIALS = 200;
 
-    const feasible = (s) => {
-      for (let i = s; i < s + c.dur; i++) if (occ[i] + 1 > cap) return false;
-      return true;
+    const timeLabel = (i) => {
+      const h = 9 + Math.floor(i / 2);
+      return `${h}:${i % 2 ? "30" : "00"}`;
     };
 
-    let candidates;
-    if (c.flexible) {
-      candidates = startsCache[c.dur].filter(feasible);
-    } else {
-      // planners only accept within ±30 min of their preferred time
-      candidates = startsCache[c.dur].filter((s) => Math.abs(s - pref) <= 1 && feasible(s));
+    function mulberry32(a) {
+      return function () {
+        a |= 0; a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
     }
 
-    if (candidates.length === 0) {
-      rej[c.dur]++;
-      continue;
-    }
-
-    let pick;
-    if (p.smart) {
-      // best-fit: pack into already-busy intervals to keep contiguous space free
-      let best = -1;
-      for (const s of candidates) {
-        let load = 0;
-        for (let i = s; i < s + c.dur; i++) load += occ[i];
-        const score = load * 100 - Math.abs(s - pref);
-        if (score > best) { best = score; pick = s; }
+    function shuffle(arr, rand) {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
       }
-    } else {
-      // naive: nearest to preference, earliest on tie
-      pick = candidates.reduce((a, s) =>
-        Math.abs(s - pref) < Math.abs(a - pref) ? s : a, candidates[0]);
     }
 
-    for (let i = pick; i < pick + c.dur; i++) occ[i]++;
-  }
+    function prefWeights(maxStart, peakBias) {
+      const b = peakBias / 100;
+      const w = [];
+      for (let i = 0; i <= maxStart; i++) {
+        const peaks = Math.exp(-((i - 3) ** 2) / 6) + 0.8 * Math.exp(-((i - 10) ** 2) / 6);
+        w.push((1 - b) * 1 + b * 2.2 * peaks);
+      }
+      return w;
+    }
 
-  const used = occ.reduce((a, c) => a + c, 0);
-  return { occ, used, req, rej };
-}
+    function sampleIdx(weights, rand) {
+      const total = weights.reduce((a, c) => a + c, 0);
+      let r = rand() * total;
+      for (let i = 0; i < weights.length; i++) {
+        r -= weights[i];
+        if (r <= 0) return i;
+      }
+      return weights.length - 1;
+    }
 
-function simulate(p, seed) {
-  const rand = mulberry32(seed);
-  const occSum = new Array(INTERVALS).fill(0);
-  let used = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
-  for (let t = 0; t < TRIALS; t++) {
-    const r = runTrial(p, rand);
-    r.occ.forEach((v, i) => (occSum[i] += v));
-    used += r.used;
-    req1 += r.req[2]; req2 += r.req[4];
-    rej1 += r.rej[2]; rej2 += r.rej[4];
-  }
-  return {
-    avgOcc: occSum.map((v) => v / TRIALS),
-    utilisation: used / TRIALS / (p.seats * INTERVALS),
-    soldSeatHours: used / TRIALS / 2,
-    rej1Rate: req1 ? rej1 / req1 : 0,
-    rej2Rate: req2 ? rej2 / req2 : 0,
-    rejTotal: (rej1 + rej2) / TRIALS,
-    reqTotal: (req1 + req2) / TRIALS,
-  };
-}
+    function runTrial(p, rand) {
+      const occ = new Array(INTERVALS).fill(0);
+      const n = p.demand;
 
-// ---------- ui ----------
-const cellColour = (frac) => {
-  // ramp from pale sage to deep spruce
-  const from = [228, 236, 233], to = [14, 91, 74];
-  const f = Math.min(1, Math.max(0, frac));
-  const c = from.map((v, i) => Math.round(v + (to[i] - v) * f));
-  return `rgb(${c[0]},${c[1]},${c[2]})`;
-};
+      const customers = [];
+      for (let k = 0; k < n; k++) {
+        customers.push({
+          dur: rand() < p.twoHourShare / 100 ? 4 : 2,
+          flexible: rand() < p.lastMinuteShare / 100,
+        });
+      }
+      const planners = customers.filter((c) => !c.flexible);
+      const flex = customers.filter((c) => c.flexible);
+      shuffle(planners, rand);
+      shuffle(flex, rand);
+      const ordered = [...planners, ...flex];
 
-function Slider({ label, value, onChange, min, max, step = 1, unit = "" }) {
-  return (
-    <label className="ctl">
-      <span className="ctl-row">
-        <span>{label}</span>
-        <span className="mono val">{value}{unit}</span>
-      </span>
-      <input type="range" min={min} max={max} step={step} value={value}
-        onChange={(e) => onChange(Number(e.target.value))} />
-    </label>
-  );
-}
-
-function Toggle({ label, on, onChange, hint }) {
-  return (
-    <button className={`toggle ${on ? "on" : ""}`} onClick={() => onChange(!on)}
-      aria-pressed={on} title={hint}>
-      <span className="pip" />
-      <span>{label}</span>
-    </button>
-  );
-}
-
-export default function App() {
-  const [seats, setSeats] = useState(30);
-  const [demand, setDemand] = useState(280);
-  const [twoHourShare, setTwoHourShare] = useState(35);
-  const [peakBias, setPeakBias] = useState(50);
-  const [lastMinuteShare, setLastMinuteShare] = useState(40);
-  const [hourAlign, setHourAlign] = useState(true);
-  const [smart, setSmart] = useState(true);
-  const [reserve, setReserve] = useState(0);
-  const [seed, setSeed] = useState(1);
-
-  const params = { seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve };
-  const r = useMemo(() => simulate(params, seed),
-    [seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve, seed]);
-
-  const pct = (v) => (v * 100).toFixed(1) + "%";
-
-  return (
-    <div className="wrap">
-      <style>{`
-        * { box-sizing: border-box; margin: 0; }
-        .wrap {
-          min-height: 100vh; background: #EEF1F0; color: #172422;
-          font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-          padding: 28px 20px 48px; font-size: 14px;
+      const weightsCache = {};
+      const validStarts = (dur) => {
+        const out = [];
+        for (let s = 0; s <= INTERVALS - dur; s++) {
+          if (dur === 4 && p.hourAlign && s % 2 !== 0) continue;
+          out.push(s);
         }
-        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-        header { max-width: 1060px; margin: 0 auto 22px; }
-        h1 { font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
-        .sub { color: #6C7A77; margin-top: 4px; max-width: 60ch; }
-        .grid { max-width: 1060px; margin: 0 auto; display: grid; grid-template-columns: 300px 1fr; gap: 18px; }
-        @media (max-width: 780px) { .grid { grid-template-columns: 1fr; } }
-        .panel { background: #fff; border: 1px solid #D8DFDD; border-radius: 10px; padding: 18px; }
-        .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #6C7A77; margin-bottom: 12px; font-weight: 600; }
-        .ctl { display: block; margin-bottom: 14px; }
-        .ctl-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
-        .val { color: #0E5B4A; font-weight: 600; }
-        input[type=range] { width: 100%; accent-color: #0E5B4A; }
-        .toggles { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
-        .toggle { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid #D8DFDD;
-          border-radius: 8px; background: #fff; cursor: pointer; font: inherit; color: inherit; text-align: left; }
-        .toggle:focus-visible { outline: 2px solid #0E5B4A; outline-offset: 1px; }
-        .toggle .pip { width: 10px; height: 10px; border-radius: 50%; background: #D8DFDD; flex: none; }
-        .toggle.on { border-color: #0E5B4A; background: #F2F7F5; }
-        .toggle.on .pip { background: #0E5B4A; }
-        .reroll { margin-top: 14px; width: 100%; padding: 9px; border-radius: 8px; border: 1px solid #172422;
-          background: #172422; color: #fff; font: inherit; cursor: pointer; }
-        .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 18px; }
-        @media (max-width: 520px) { .metrics { grid-template-columns: 1fr; } }
-        .metric { background: #fff; border: 1px solid #D8DFDD; border-radius: 10px; padding: 14px 16px; }
-        .metric .k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #6C7A77; font-weight: 600; }
-        .metric .v { font-size: 30px; font-weight: 650; margin-top: 4px; letter-spacing: -0.02em; }
-        .metric .n { color: #6C7A77; font-size: 12px; margin-top: 2px; }
-        .ledger { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; margin: 10px 0 4px; }
-        .cell { border-radius: 4px; aspect-ratio: 1 / 1.5; display: flex; align-items: flex-end;
-          justify-content: center; padding-bottom: 6px; font-size: 12px; font-weight: 600; }
-        .axis { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; color: #6C7A77; font-size: 10px; }
-        .axis span { text-align: center; }
-        .bars { margin-top: 16px; }
-        .bar-row { display: grid; grid-template-columns: 120px 1fr 64px; align-items: center; gap: 10px; margin-bottom: 8px; }
-        .bar-track { background: #EEF1F0; border-radius: 4px; height: 14px; overflow: hidden; }
-        .bar-fill { height: 100%; background: #B5432B; border-radius: 4px; transition: width 0.25s; }
-        .note { color: #6C7A77; font-size: 12px; margin-top: 16px; line-height: 1.5; max-width: 70ch; }
-      `}</style>
+        return out;
+      };
+      const startsCache = { 2: validStarts(2), 4: validStarts(4) };
 
-      <header>
-        <h1>Theory test seat simulator</h1>
-        <p className="sub">
-          One day, 09:00 to 17:00, {seats} seats, 30-minute grid. {TRIALS} random days are
-          simulated per setting; results below are averages.
-        </p>
-      </header>
+      const req = { 2: 0, 4: 0 };
+      const rej = { 2: 0, 4: 0 };
 
-      <div className="grid">
-        <div>
-          <div className="panel">
-            <h2>Demand scenario</h2>
-            <Slider label="Seats" value={seats} onChange={setSeats} min={10} max={60} />
-            <Slider label="Booking attempts / day" value={demand} onChange={setDemand} min={50} max={500} step={10} />
-            <Slider label="2-hour share of requests" value={twoHourShare} onChange={setTwoHourShare} min={0} max={100} unit="%" />
-            <Slider label="Peak-time bias" value={peakBias} onChange={setPeakBias} min={0} max={100} unit="%" />
-            <Slider label="Last-minute share" value={lastMinuteShare} onChange={setLastMinuteShare} min={0} max={100} unit="%" />
+      for (const c of ordered) {
+        req[c.dur]++;
+        const cap = c.dur === 2 ? p.seats - p.reserve : p.seats;
+        const maxStart = INTERVALS - c.dur;
+        if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
+        const pref = sampleIdx(weightsCache[c.dur], rand);
 
-            <h2 style={{ marginTop: 18 }}>Booking policy</h2>
-            <div className="toggles">
-              <Toggle label="2h slots start on the hour" on={hourAlign} onChange={setHourAlign}
-                hint="Restricts 2-hour bookings to 9:00, 10:00, 11:00…" />
-              <Toggle label="Smart placement" on={smart} onChange={setSmart}
-                hint="Flexible customers are steered into already-busy intervals to limit fragmentation" />
-            </div>
-            <div style={{ marginTop: 14 }}>
-              <Slider label="Seats reserved for 2h bookings" value={reserve} onChange={setReserve} min={0} max={10} />
-            </div>
-            <button className="reroll" onClick={() => setSeed((s) => s + 1)}>Re-run with new randomness</button>
-          </div>
-        </div>
+        const feasible = (s) => {
+          for (let i = s; i < s + c.dur; i++) if (occ[i] + 1 > cap) return false;
+          return true;
+        };
 
-        <div>
-          <div className="metrics">
-            <div className="metric">
-              <div className="k">Utilisation</div>
-              <div className="v mono">{pct(r.utilisation)}</div>
-              <div className="n">{r.soldSeatHours.toFixed(0)} of {seats * 8} seat-hours sold</div>
-            </div>
-            <div className="metric">
-              <div className="k">1h rejections</div>
-              <div className="v mono" style={{ color: r.rej1Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(r.rej1Rate)}</div>
-              <div className="n">of 1-hour requests turned away</div>
-            </div>
-            <div className="metric">
-              <div className="k">2h rejections</div>
-              <div className="v mono" style={{ color: r.rej2Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(r.rej2Rate)}</div>
-              <div className="n">of 2-hour requests turned away</div>
-            </div>
-          </div>
+        let candidates;
+        if (c.flexible) {
+          candidates = startsCache[c.dur].filter(feasible);
+        } else {
+          candidates = startsCache[c.dur].filter((s) => Math.abs(s - pref) <= 1 && feasible(s));
+        }
 
-          <div className="panel">
-            <h2>Average seats occupied per half hour</h2>
-            <div className="ledger">
-              {r.avgOcc.map((v, i) => {
-                const f = v / seats;
-                return (
-                  <div key={i} className="cell mono"
-                    style={{ background: cellColour(f), color: f > 0.55 ? "#fff" : "#172422" }}>
-                    {Math.round(v)}
-                  </div>
-                );
-              })}
-            </div>
-            <div className="axis mono">
-              {Array.from({ length: INTERVALS }, (_, i) => (
-                <span key={i}>{i % 2 === 0 ? timeLabel(i).replace(":00", "") : ""}</span>
-              ))}
-            </div>
+        if (candidates.length === 0) {
+          rej[c.dur]++;
+          continue;
+        }
 
-            <div className="bars">
-              <h2>Where demand is lost</h2>
-              <div className="bar-row">
-                <span>1h requests</span>
-                <div className="bar-track"><div className="bar-fill" style={{ width: `${Math.min(100, r.rej1Rate * 100)}%` }} /></div>
-                <span className="mono">{pct(r.rej1Rate)}</span>
-              </div>
-              <div className="bar-row">
-                <span>2h requests</span>
-                <div className="bar-track"><div className="bar-fill" style={{ width: `${Math.min(100, r.rej2Rate * 100)}%` }} /></div>
-                <span className="mono">{pct(r.rej2Rate)}</span>
-              </div>
-            </div>
+        let pick;
+        if (p.smart) {
+          let best = -1;
+          for (const s of candidates) {
+            let load = 0;
+            for (let i = s; i < s + c.dur; i++) load += occ[i];
+            const score = load * 100 - Math.abs(s - pref);
+            if (score > best) { best = score; pick = s; }
+          }
+        } else {
+          pick = candidates.reduce((a, s) =>
+            Math.abs(s - pref) < Math.abs(a - pref) ? s : a, candidates[0]);
+        }
 
-            <p className="note">
-              Model assumptions: planners book ahead and only accept a start within 30 minutes of
-              their preferred time; last-minute customers arrive after planners and take any
-              available start. Peak-time bias concentrates preferences around mid-morning and
-              mid-afternoon. Reserved seats are held back from 1-hour bookings all day (no
-              release window is modelled). A useful diagnostic: if 2h rejections climb while
-              utilisation sits below ~85%, fragmentation, not demand, is the constraint.
+        for (let i = pick; i < pick + c.dur; i++) occ[i]++;
+      }
+
+      const used = occ.reduce((a, c) => a + c, 0);
+      return { occ, used, req, rej };
+    }
+
+    function simulate(p, seed) {
+      const rand = mulberry32(seed);
+      const occSum = new Array(INTERVALS).fill(0);
+      let used = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
+      for (let t = 0; t < TRIALS; t++) {
+        const r = runTrial(p, rand);
+        r.occ.forEach((v, i) => (occSum[i] += v));
+        used += r.used;
+        req1 += r.req[2]; req2 += r.req[4];
+        rej1 += r.rej[2]; rej2 += r.rej[4];
+      }
+      return {
+        avgOcc: occSum.map((v) => v / TRIALS),
+        utilisation: used / TRIALS / (p.seats * INTERVALS),
+        soldSeatHours: used / TRIALS / 2,
+        rej1Rate: req1 ? rej1 / req1 : 0,
+        rej2Rate: req2 ? rej2 / req2 : 0,
+        rejTotal: (rej1 + rej2) / TRIALS,
+        reqTotal: (req1 + req2) / TRIALS,
+      };
+    }
+
+    const cellColour = (frac) => {
+      const from = [228, 236, 233], to = [14, 91, 74];
+      const f = Math.min(1, Math.max(0, frac));
+      const c = from.map((v, i) => Math.round(v + (to[i] - v) * f));
+      return `rgb(${c[0]},${c[1]},${c[2]})`;
+    };
+
+    function Slider({ label, value, onChange, min, max, step = 1, unit = "" }) {
+      return (
+        <label className="ctl">
+          <span className="ctl-row">
+            <span>{label}</span>
+            <span className="mono val">{value}{unit}</span>
+          </span>
+          <input type="range" min={min} max={max} step={step} value={value}
+            onChange={(e) => onChange(Number(e.target.value))} />
+        </label>
+      );
+    }
+
+    function Toggle({ label, on, onChange, hint }) {
+      return (
+        <button className={`toggle ${on ? "on" : ""}`} onClick={() => onChange(!on)}
+          aria-pressed={on} title={hint}>
+          <span className="pip" />
+          <span>{label}</span>
+        </button>
+      );
+    }
+
+    function App() {
+      const [seats, setSeats] = useState(30);
+      const [demand, setDemand] = useState(280);
+      const [twoHourShare, setTwoHourShare] = useState(35);
+      const [peakBias, setPeakBias] = useState(50);
+      const [lastMinuteShare, setLastMinuteShare] = useState(40);
+      const [hourAlign, setHourAlign] = useState(true);
+      const [smart, setSmart] = useState(true);
+      const [reserve, setReserve] = useState(0);
+      const [seed, setSeed] = useState(1);
+
+      const params = { seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve };
+      const r = useMemo(() => simulate(params, seed),
+        [seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve, seed]);
+
+      const pct = (v) => (v * 100).toFixed(1) + "%";
+
+      return (
+        <div className="wrap">
+          <style>{`
+            * { box-sizing: border-box; margin: 0; }
+            .wrap {
+              min-height: 100vh; background: #EEF1F0; color: #172422;
+              font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+              padding: 28px 20px 48px; font-size: 14px;
+            }
+            .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+            header { max-width: 1060px; margin: 0 auto 22px; }
+            h1 { font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
+            .sub { color: #6C7A77; margin-top: 4px; max-width: 60ch; }
+            .grid { max-width: 1060px; margin: 0 auto; display: grid; grid-template-columns: 300px 1fr; gap: 18px; }
+            @media (max-width: 780px) { .grid { grid-template-columns: 1fr; } }
+            .panel { background: #fff; border: 1px solid #D8DFDD; border-radius: 10px; padding: 18px; }
+            .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #6C7A77; margin-bottom: 12px; font-weight: 600; }
+            .ctl { display: block; margin-bottom: 14px; }
+            .ctl-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+            .val { color: #0E5B4A; font-weight: 600; }
+            input[type=range] { width: 100%; accent-color: #0E5B4A; }
+            .toggles { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+            .toggle { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid #D8DFDD;
+              border-radius: 8px; background: #fff; cursor: pointer; font: inherit; color: inherit; text-align: left; }
+            .toggle:focus-visible { outline: 2px solid #0E5B4A; outline-offset: 1px; }
+            .toggle .pip { width: 10px; height: 10px; border-radius: 50%; background: #D8DFDD; flex: none; }
+            .toggle.on { border-color: #0E5B4A; background: #F2F7F5; }
+            .toggle.on .pip { background: #0E5B4A; }
+            .reroll { margin-top: 14px; width: 100%; padding: 9px; border-radius: 8px; border: 1px solid #172422;
+              background: #172422; color: #fff; font: inherit; cursor: pointer; }
+            .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 18px; }
+            @media (max-width: 520px) { .metrics { grid-template-columns: 1fr; } }
+            .metric { background: #fff; border: 1px solid #D8DFDD; border-radius: 10px; padding: 14px 16px; }
+            .metric .k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #6C7A77; font-weight: 600; }
+            .metric .v { font-size: 30px; font-weight: 650; margin-top: 4px; letter-spacing: -0.02em; }
+            .metric .n { color: #6C7A77; font-size: 12px; margin-top: 2px; }
+            .ledger { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; margin: 10px 0 4px; }
+            .cell { border-radius: 4px; aspect-ratio: 1 / 1.5; display: flex; align-items: flex-end;
+              justify-content: center; padding-bottom: 6px; font-size: 12px; font-weight: 600; }
+            .axis { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; color: #6C7A77; font-size: 10px; }
+            .axis span { text-align: center; }
+            .bars { margin-top: 16px; }
+            .bar-row { display: grid; grid-template-columns: 120px 1fr 64px; align-items: center; gap: 10px; margin-bottom: 8px; }
+            .bar-track { background: #EEF1F0; border-radius: 4px; height: 14px; overflow: hidden; }
+            .bar-fill { height: 100%; background: #B5432B; border-radius: 4px; transition: width 0.25s; }
+            .note { color: #6C7A77; font-size: 12px; margin-top: 16px; line-height: 1.5; max-width: 70ch; }
+          `}</style>
+
+          <header>
+            <h1>Theory test seat simulator</h1>
+            <p className="sub">
+              One day, 09:00 to 17:00, {seats} seats, 30-minute grid. {TRIALS} random days are
+              simulated per setting; results below are averages.
             </p>
+          </header>
+
+          <div className="grid">
+            <div>
+              <div className="panel">
+                <h2>Demand scenario</h2>
+                <Slider label="Seats" value={seats} onChange={setSeats} min={10} max={60} />
+                <Slider label="Booking attempts / day" value={demand} onChange={setDemand} min={50} max={500} step={10} />
+                <Slider label="2-hour share of requests" value={twoHourShare} onChange={setTwoHourShare} min={0} max={100} unit="%" />
+                <Slider label="Peak-time bias" value={peakBias} onChange={setPeakBias} min={0} max={100} unit="%" />
+                <Slider label="Last-minute share" value={lastMinuteShare} onChange={setLastMinuteShare} min={0} max={100} unit="%" />
+
+                <h2 style={{ marginTop: 18 }}>Booking policy</h2>
+                <div className="toggles">
+                  <Toggle label="2h slots start on the hour" on={hourAlign} onChange={setHourAlign}
+                    hint="Restricts 2-hour bookings to 9:00, 10:00, 11:00…" />
+                  <Toggle label="Smart placement" on={smart} onChange={setSmart}
+                    hint="Flexible customers are steered into already-busy intervals to limit fragmentation" />
+                </div>
+                <div style={{ marginTop: 14 }}>
+                  <Slider label="Seats reserved for 2h bookings" value={reserve} onChange={setReserve} min={0} max={10} />
+                </div>
+                <button className="reroll" onClick={() => setSeed((s) => s + 1)}>Re-run with new randomness</button>
+              </div>
+            </div>
+
+            <div>
+              <div className="metrics">
+                <div className="metric">
+                  <div className="k">Utilisation</div>
+                  <div className="v mono">{pct(r.utilisation)}</div>
+                  <div className="n">{r.soldSeatHours.toFixed(0)} of {seats * 8} seat-hours sold</div>
+                </div>
+                <div className="metric">
+                  <div className="k">1h rejections</div>
+                  <div className="v mono" style={{ color: r.rej1Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(r.rej1Rate)}</div>
+                  <div className="n">of 1-hour requests turned away</div>
+                </div>
+                <div className="metric">
+                  <div className="k">2h rejections</div>
+                  <div className="v mono" style={{ color: r.rej2Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(r.rej2Rate)}</div>
+                  <div className="n">of 2-hour requests turned away</div>
+                </div>
+              </div>
+
+              <div className="panel">
+                <h2>Average seats occupied per half hour</h2>
+                <div className="ledger">
+                  {r.avgOcc.map((v, i) => {
+                    const f = v / seats;
+                    return (
+                      <div key={i} className="cell mono"
+                        style={{ background: cellColour(f), color: f > 0.55 ? "#fff" : "#172422" }}>
+                        {Math.round(v)}
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="axis mono">
+                  {Array.from({ length: INTERVALS }, (_, i) => (
+                    <span key={i}>{i % 2 === 0 ? timeLabel(i).replace(":00", "") : ""}</span>
+                  ))}
+                </div>
+
+                <div className="bars">
+                  <h2>Where demand is lost</h2>
+                  <div className="bar-row">
+                    <span>1h requests</span>
+                    <div className="bar-track"><div className="bar-fill" style={{ width: `${Math.min(100, r.rej1Rate * 100)}%` }} /></div>
+                    <span className="mono">{pct(r.rej1Rate)}</span>
+                  </div>
+                  <div className="bar-row">
+                    <span>2h requests</span>
+                    <div className="bar-track"><div className="bar-fill" style={{ width: `${Math.min(100, r.rej2Rate * 100)}%` }} /></div>
+                    <span className="mono">{pct(r.rej2Rate)}</span>
+                  </div>
+                </div>
+
+                <p className="note">
+                  Model assumptions: planners book ahead and only accept a start within 30 minutes of
+                  their preferred time; last-minute customers arrive after planners and take any
+                  available start. Peak-time bias concentrates preferences around mid-morning and
+                  mid-afternoon. Reserved seats are held back from 1-hour bookings all day (no
+                  release window is modelled). A useful diagnostic: if 2h rejections climb while
+                  utilisation sits below ~85%, fragmentation, not demand, is the constraint.
+                </p>
+              </div>
+            </div>
           </div>
         </div>
-      </div>
-    </div>
-  );
-}
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
