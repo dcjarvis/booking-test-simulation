@@ -33,6 +33,29 @@ const timeLabel = (i) => {
   return `${h}:${i % 2 ? "30" : "00"}`;
 };
 
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+// Each trial represents one trading day; dayIndex 0 is the next business day.
+function bookingDay(dayIndex) {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + 1);
+  let remaining = dayIndex;
+  for (;;) {
+    const isWeekday = d.getDay() !== 0 && d.getDay() !== 6;
+    if (isWeekday) {
+      if (remaining === 0) break;
+      remaining--;
+    }
+    d.setDate(d.getDate() + 1);
+  }
+  const pad = (v) => String(v).padStart(2, "0");
+  return {
+    day: DAY_NAMES[d.getDay()],
+    date: `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`,
+  };
+}
+
 function mulberry32(a) {
   return function () {
     a |= 0; a = (a + 0x6d2b79f5) | 0;
@@ -154,7 +177,8 @@ function simulateBasic(p, seed) {
 }
 
 // ---------- Model 1: Flow optimised (50/50 stream constraint) ----------
-function runTrialFlowOptimised(p, rand) {
+function runTrialFlowOptimised(p, rand, dayIndex = 0) {
+  const { day, date } = bookingDay(dayIndex);
   const occ = new Array(INTERVALS).fill(0);
   const n = p.demand;
   
@@ -205,7 +229,7 @@ function runTrialFlowOptimised(p, rand) {
     }
     
     if (candidates.length === 0) { rej[c.dur]++; 
-      results.push({ duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, startTime: null, model: 'Flow Optimised' });
+      results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, startTime: null, model: 'Flow Optimised' });
       continue; }
     
     let pick;
@@ -222,7 +246,7 @@ function runTrialFlowOptimised(p, rand) {
     }
     
     for (let i = pick; i < pick + c.dur; i++) occ[i]++;
-    results.push({ duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, startTime: timeLabel(pick), model: 'Flow Optimised' });
+    results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, startTime: timeLabel(pick), model: 'Flow Optimised' });
   }
   
   const used = occ.reduce((a, c) => a + c, 0);
@@ -242,7 +266,7 @@ function simulateFlowOptimised(p, seed) {
   const totalCapacity = (halfHourCap - p.reserve + hourCap) * INTERVALS;
   
   for (let t = 0; t < TRIALS; t++) {
-    const r = runTrialFlowOptimised(p, rand);
+    const r = runTrialFlowOptimised(p, rand, t);
     r.occ.forEach((v, i) => (occSum[i] += v));
     used += r.used;
     req1 += r.req[2]; req2 += r.req[4];
@@ -260,7 +284,8 @@ function simulateFlowOptimised(p, seed) {
 }
 
 // ---------- Model 2: Utilisation optimised (no stream constraint) ----------
-function runTrialUtilisationOptimised(p, rand) {
+function runTrialUtilisationOptimised(p, rand, dayIndex = 0) {
+  const { day, date } = bookingDay(dayIndex);
   const occ = new Array(INTERVALS).fill(0);
   const n = p.demand;
   
@@ -308,7 +333,7 @@ function runTrialUtilisationOptimised(p, rand) {
     }
     
     if (candidates.length === 0) { rej[c.dur]++; 
-      results.push({ duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, startTime: null, model: 'Utilisation Optimised' });
+      results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, startTime: null, model: 'Utilisation Optimised' });
       continue; }
     
     let pick;
@@ -325,7 +350,7 @@ function runTrialUtilisationOptimised(p, rand) {
     }
     
     for (let i = pick; i < pick + c.dur; i++) occ[i]++;
-    results.push({ duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, startTime: timeLabel(pick), model: 'Utilisation Optimised' });
+    results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, startTime: timeLabel(pick), model: 'Utilisation Optimised' });
   }
   
   const used = occ.reduce((a, c) => a + c, 0);
@@ -338,7 +363,7 @@ function simulateUtilisationOptimised(p, seed) {
   let used = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
   let allResults = [];
   for (let t = 0; t < TRIALS; t++) {
-    const r = runTrialUtilisationOptimised(p, rand);
+    const r = runTrialUtilisationOptimised(p, rand, t);
     r.occ.forEach((v, i) => (occSum[i] += v));
     used += r.used;
     req1 += r.req[2]; req2 += r.req[4];
@@ -582,9 +607,11 @@ function App() {
 
   // Convert results to CSV
   const downloadCSV = () => {
-    const headers = ['Model', 'Duration', 'Flexible', 'Accepted', 'Start Time'];
+    const headers = ['Model', 'Day', 'Date', 'Duration', 'Flexible', 'Accepted', 'Start Time'];
     const rows = allResults.map(r => [
       r.model,
+      r.day,
+      r.date,
       r.duration,
       r.flexible ? 'Yes' : 'No',
       r.accepted ? 'Yes' : 'No',
@@ -801,6 +828,8 @@ function App() {
               <thead style={{ position: "sticky", top: 0, background: "#F7F9F8" }}>
                 <tr>
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Model</th>
+                  <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Day</th>
+                  <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Date</th>
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Duration</th>
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Flexible</th>
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Accepted</th>
@@ -811,6 +840,8 @@ function App() {
                 {allResults.slice(0, 100).map((r, i) => (
                   <tr key={i} style={{ borderBottom: "1px solid #E3E9E7" }}>
                     <td style={{ padding: "8px 12px", color: r.model === 'Flow Optimised' ? "#45524F" : "#0E5B4A" }}>{r.model}</td>
+                    <td style={{ padding: "8px 12px" }}>{r.day}</td>
+                    <td style={{ padding: "8px 12px", fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" }}>{r.date}</td>
                     <td style={{ padding: "8px 12px" }}>{r.duration}</td>
                     <td style={{ padding: "8px 12px" }}>{r.flexible ? 'Yes' : 'No'}</td>
                     <td style={{ padding: "8px 12px", color: r.accepted ? "#0E5B4A" : "#B5432B" }}>{r.accepted ? 'Yes' : 'No'}</td>
