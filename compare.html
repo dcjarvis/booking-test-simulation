@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="description" content="Compare the basic and advanced theory test seat simulator models side by side">
+<meta name="description" content="Compare flow optimised vs utilisation optimised booking models for theory test seats">
 <meta name="theme-color" content="#0E5B4A">
-<title>Simulator Comparison — Theory Test Seats</title>
+<title>Flow vs Utilisation Models — Theory Test Seats</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'><rect fill='%230E5B4A' width='180' height='180'/><text x='90' y='100' font-size='120' font-weight='bold' fill='white' text-anchor='middle' dominant-baseline='central'>T</text></svg>">
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -139,6 +139,185 @@ function simulateBasic(p, seed) {
   let used = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
   for (let t = 0; t < TRIALS; t++) {
     const r = runTrialBasic(p, rand);
+    r.occ.forEach((v, i) => (occSum[i] += v));
+    used += r.used;
+    req1 += r.req[2]; req2 += r.req[4];
+    rej1 += r.rej[2]; rej2 += r.rej[4];
+  }
+  return {
+    avgOcc: occSum.map((v) => v / TRIALS),
+    utilisation: used / TRIALS / (p.seats * INTERVALS),
+    soldSeatHours: used / TRIALS / 2,
+    rej1Rate: req1 ? rej1 / req1 : 0,
+    rej2Rate: req2 ? rej2 / req2 : 0,
+  };
+}
+
+// ---------- Model 1: Flow optimised (50/50 stream constraint) ----------
+function runTrialFlowOptimised(p, rand) {
+  const occ = new Array(INTERVALS).fill(0);
+  const n = p.demand;
+  
+  // Separate capacity into two streams
+  const halfHourCap = Math.floor(p.seats * 0.5); // 50% for half-hour bookings
+  const hourCap = Math.floor(p.seats * 0.5); // 50% for hour bookings
+  
+  const customers = [];
+  for (let k = 0; k < n; k++) {
+    customers.push({
+      dur: rand() < p.twoHourShare / 100 ? 4 : 2,
+      flexible: rand() < p.lastMinuteShare / 100,
+    });
+  }
+  
+  const planners = customers.filter((c) => !c.flexible);
+  const flex = customers.filter((c) => c.flexible);
+  shuffle(planners, rand);
+  shuffle(flex, rand);
+  const ordered = [...planners, ...flex];
+  
+  const weightsCache = {};
+  const startsCache = { 2: validStarts(2, p.hourAlign), 4: validStarts(4, p.hourAlign) };
+  const req = { 2: 0, 4: 0 };
+  const rej = { 2: 0, 4: 0 };
+  
+  for (const c of ordered) {
+    req[c.dur]++;
+    // Use stream-specific capacity
+    const cap = c.dur === 2 ? halfHourCap : hourCap;
+    const maxStart = INTERVALS - c.dur;
+    
+    if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
+    const pref = sampleIdx(weightsCache[c.dur], rand);
+    
+    const feasible = (s) => {
+      for (let i = s; i < s + c.dur; i++) if (occ[i] + 1 > cap) return false;
+      return true;
+    };
+    
+    let candidates;
+    if (c.flexible) {
+      candidates = startsCache[c.dur].filter(feasible);
+    } else {
+      candidates = startsCache[c.dur].filter((s) => Math.abs(s - pref) <= 1 && feasible(s));
+    }
+    
+    if (candidates.length === 0) { rej[c.dur]++; continue; }
+    
+    let pick;
+    if (p.smart) {
+      let best = -1;
+      for (const s of candidates) {
+        let load = 0;
+        for (let i = s; i < s + c.dur; i++) load += occ[i];
+        const score = load * 100 - Math.abs(s - pref);
+        if (score > best) { best = score; pick = s; }
+      }
+    } else {
+      pick = candidates.reduce((a, s) => Math.abs(s - pref) < Math.abs(a - pref) ? s : a, candidates[0]);
+    }
+    
+    for (let i = pick; i < pick + c.dur; i++) occ[i]++;
+  }
+  
+  const used = occ.reduce((a, c) => a + c, 0);
+  return { occ, used, req, rej };
+}
+
+function simulateFlowOptimised(p, seed) {
+  const rand = mulberry32(seed);
+  const occSum = new Array(INTERVALS).fill(0);
+  let used = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
+  for (let t = 0; t < TRIALS; t++) {
+    const r = runTrialFlowOptimised(p, rand);
+    r.occ.forEach((v, i) => (occSum[i] += v));
+    used += r.used;
+    req1 += r.req[2]; req2 += r.req[4];
+    rej1 += r.rej[2]; rej2 += r.rej[4];
+  }
+  return {
+    avgOcc: occSum.map((v) => v / TRIALS),
+    utilisation: used / TRIALS / (p.seats * INTERVALS),
+    soldSeatHours: used / TRIALS / 2,
+    rej1Rate: req1 ? rej1 / req1 : 0,
+    rej2Rate: req2 ? rej2 / req2 : 0,
+  };
+}
+
+// ---------- Model 2: Utilisation optimised (no stream constraint) ----------
+function runTrialUtilisationOptimised(p, rand) {
+  const occ = new Array(INTERVALS).fill(0);
+  const n = p.demand;
+  
+  // No 50/50 constraint - use full capacity for both streams
+  const customers = [];
+  for (let k = 0; k < n; k++) {
+    customers.push({
+      dur: rand() < p.twoHourShare / 100 ? 4 : 2,
+      flexible: rand() < p.lastMinuteShare / 100,
+    });
+  }
+  
+  const planners = customers.filter((c) => !c.flexible);
+  const flex = customers.filter((c) => c.flexible);
+  shuffle(planners, rand);
+  shuffle(flex, rand);
+  const ordered = [...planners, ...flex];
+  
+  const weightsCache = {};
+  const startsCache = { 2: validStarts(2, p.hourAlign), 4: validStarts(4, p.hourAlign) };
+  const req = { 2: 0, 4: 0 };
+  const rej = { 2: 0, 4: 0 };
+  
+  for (const c of ordered) {
+    req[c.dur]++;
+    // Use full capacity for both durations
+    const cap = c.dur === 2 ? p.seats - p.reserve : p.seats;
+    const maxStart = INTERVALS - c.dur;
+    
+    if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
+    const pref = sampleIdx(weightsCache[c.dur], rand);
+    
+    const feasible = (s) => {
+      for (let i = s; i < s + c.dur; i++) if (occ[i] + 1 > cap) return false;
+      return true;
+    };
+    
+    let candidates;
+    if (c.flexible) {
+      candidates = startsCache[c.dur].filter(feasible);
+    } else {
+      candidates = startsCache[c.dur].filter((s) => Math.abs(s - pref) <= 1 && feasible(s));
+    }
+    
+    if (candidates.length === 0) { rej[c.dur]++; continue; }
+    
+    let pick;
+    if (p.smart) {
+      let best = -1;
+      for (const s of candidates) {
+        let load = 0;
+        for (let i = s; i < s + c.dur; i++) load += occ[i];
+        const score = load * 100 - Math.abs(s - pref);
+        if (score > best) { best = score; pick = s; }
+      }
+    } else {
+      pick = candidates.reduce((a, s) => Math.abs(s - pref) < Math.abs(a - pref) ? s : a, candidates[0]);
+    }
+    
+    for (let i = pick; i < pick + c.dur; i++) occ[i]++;
+  }
+  
+  const used = occ.reduce((a, c) => a + c, 0);
+  return { occ, used, req, rej };
+}
+
+function simulateUtilisationOptimised(p, seed) {
+  const rand = mulberry32(seed);
+  const occSum = new Array(INTERVALS).fill(0);
+  let used = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
+  for (let t = 0; t < TRIALS; t++) {
+    const r = runTrialUtilisationOptimised(p, rand);
     r.occ.forEach((v, i) => (occSum[i] += v));
     used += r.used;
     req1 += r.req[2]; req2 += r.req[4];
@@ -347,24 +526,15 @@ function App() {
   const [smart, setSmart] = useState(true);
   const [reserve, setReserve] = useState(0);
 
-  // advanced-only params
-  const [cancelRate, setCancelRate] = useState(8);
-  const [lateCancelShare, setLateCancelShare] = useState(60);
-  const [releaseReserve, setReleaseReserve] = useState(true);
-  const [overbook, setOverbook] = useState(0);
-  const [incentive, setIncentive] = useState(0);
-
   const [seed, setSeed] = useState(1);
 
   const shared = { seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve };
-  const advParams = { ...shared, cancelRate, lateCancelShare, releaseReserve, overbook, incentive };
 
-  const a = useMemo(() => simulateBasic(shared, seed), [
+  const model1 = useMemo(() => simulateFlowOptimised(shared, seed), [
     seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve, seed,
   ]);
-  const b = useMemo(() => simulateAdv(advParams, seed), [
-    seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve,
-    cancelRate, lateCancelShare, releaseReserve, overbook, incentive, seed,
+  const model2 = useMemo(() => simulateUtilisationOptimised(shared, seed), [
+    seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve, seed,
   ]);
 
   const pct = (v) => (v * 100).toFixed(1) + "%";
@@ -404,7 +574,8 @@ function App() {
         .badge { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 700;
           text-transform: uppercase; letter-spacing: 0.06em; }
         .badge.basic { background: #E7ECEA; color: #45524F; }
-        .badge.adv { background: #0E5B4A; color: #fff; }
+        .badge.flow { background: #E7ECEA; color: #45524F; }
+        .badge.util { background: #0E5B4A; color: #fff; }
         .colnote { color: #6C7A77; font-size: 12px; margin-top: 4px; margin-bottom: 12px; max-width: 55ch; }
         .metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 16px; }
         .metric { background: #F7F9F8; border: 1px solid #E3E9E7; border-radius: 8px; padding: 10px 12px; }
@@ -425,11 +596,12 @@ function App() {
       `}</style>
 
       <header>
-        <h1>Simulator comparison: basic vs advanced</h1>
+        <h1>Simulator comparison: Flow optimised vs Utilisation optimised</h1>
         <p className="sub">
-          Same demand scenario run through both booking models side by side. Set advanced-only
-          levers (cancellations, overbooking, incentives) to zero and the two columns match exactly —
-          nudge them up to see what each lever changes.
+          Same demand scenario run through both booking models side by side. Model 1 uses a 50/50 stream constraint
+          (separate fixed cohorts for hour and half-hour bookings), while Model 2 has no stream constraint and maximises
+          utilisation based on available capacity. This comparison shows whether allowing the mix to flex produces
+          materially better utilisation and fewer rejected bookings.
         </p>
       </header>
 
@@ -451,95 +623,74 @@ function App() {
           </div>
           <Slider label="Seats reserved for 2h bookings" value={reserve} onChange={setReserve} min={0} max={10} />
 
-          <div className="divider" />
-
-          <h2>Advanced-only levers</h2>
-          <Slider label="Cancellation rate" value={cancelRate} onChange={setCancelRate} min={0} max={30} unit="%" />
-          <Slider label="Cancellations inside 3-day cutoff" value={lateCancelShare} onChange={setLateCancelShare} min={0} max={100} unit="%" />
-          <div className="toggles">
-            <Toggle label="Release reserve to late bookers" on={releaseReserve} onChange={setReleaseReserve}
-              hint="Unsold reserved seats open up to 1-hour bookings once last-minute demand arrives" />
-          </div>
-          <Slider label="Overbooking per interval" value={overbook} onChange={setOverbook} min={0} max={6} unit=" seats" />
-          <Slider label="Flexibility incentive uptake" value={incentive} onChange={setIncentive} min={0} max={100} unit="%" />
-
           <button className="reroll" onClick={() => setSeed((s) => s + 1)}>Re-run with new randomness</button>
         </div>
 
         <div>
-          <div className="colhead"><span className="badge basic">Basic model</span></div>
-          <p className="colnote">index.html — no cancellations, no overbooking, fixed ±30min acceptance window.</p>
+          <div className="colhead"><span className="badge flow">Model 1: Flow optimised</span></div>
+          <p className="colnote">Separate fixed cohorts for hour and half-hour bookings. Each stream has a maximum intake of 50% of available capacity. Combined theoretical ceiling of 100%.</p>
           <div className="panel">
             <div className="metrics">
               <div className="metric">
                 <div className="k">Utilisation</div>
-                <div className="v mono">{pct(a.utilisation)}</div>
+                <div className="v mono">{pct(model1.utilisation)}</div>
               </div>
               <div className="metric">
                 <div className="k">Sold seat-hours</div>
-                <div className="v mono">{a.soldSeatHours.toFixed(0)}</div>
+                <div className="v mono">{model1.soldSeatHours.toFixed(0)}</div>
               </div>
               <div className="metric">
                 <div className="k">1h rejections</div>
-                <div className="v mono" style={{ color: a.rej1Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(a.rej1Rate)}</div>
+                <div className="v mono" style={{ color: model1.rej1Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(model1.rej1Rate)}</div>
               </div>
               <div className="metric">
                 <div className="k">2h rejections</div>
-                <div className="v mono" style={{ color: a.rej2Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(a.rej2Rate)}</div>
+                <div className="v mono" style={{ color: model1.rej2Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(model1.rej2Rate)}</div>
               </div>
             </div>
             <h2>Average seats occupied per half hour</h2>
-            <Heatmap avgOcc={a.avgOcc} seats={seats} />
+            <Heatmap avgOcc={model1.avgOcc} seats={seats} />
           </div>
         </div>
 
         <div>
-          <div className="colhead"><span className="badge adv">Advanced model</span></div>
-          <p className="colnote">index2.html — adds cancellations, 3-day cutoff, reserve release, overbooking, flexibility incentive.</p>
+          <div className="colhead"><span className="badge util">Model 2: Utilisation optimised</span></div>
+          <p className="colnote">No 50/50 stream constraint. Bookings are accepted based on available capacity and the algorithm tries to maximise utilisation. The hour/half-hour mix can flex based on demand.</p>
           <div className="panel">
             <div className="metrics">
               <div className="metric">
                 <div className="k">Utilisation</div>
-                <div className="v mono">{pct(b.utilisation)}</div>
-                <div className="d"><Delta a={a.utilisation} b={b.utilisation} fmt={pctPts} /></div>
+                <div className="v mono">{pct(model2.utilisation)}</div>
+                <div className="d"><Delta a={model1.utilisation} b={model2.utilisation} fmt={pctPts} /></div>
               </div>
               <div className="metric">
-                <div className="k">Paid seat-hours</div>
-                <div className="v mono">{b.paidSeatHours.toFixed(0)}</div>
-                <div className="d"><Delta a={a.soldSeatHours} b={b.paidSeatHours} fmt={(v) => v.toFixed(0)} /></div>
+                <div className="k">Sold seat-hours</div>
+                <div className="v mono">{model2.soldSeatHours.toFixed(0)}</div>
+                <div className="d"><Delta a={model1.soldSeatHours} b={model2.soldSeatHours} fmt={(v) => v.toFixed(0)} /></div>
               </div>
               <div className="metric">
                 <div className="k">1h rejections</div>
-                <div className="v mono" style={{ color: b.rej1Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(b.rej1Rate)}</div>
-                <div className="d"><Delta a={a.rej1Rate} b={b.rej1Rate} higherIsBetter={false} fmt={pctPts} /></div>
+                <div className="v mono" style={{ color: model2.rej1Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(model2.rej1Rate)}</div>
+                <div className="d"><Delta a={model1.rej1Rate} b={model2.rej1Rate} higherIsBetter={false} fmt={pctPts} /></div>
               </div>
               <div className="metric">
                 <div className="k">2h rejections</div>
-                <div className="v mono" style={{ color: b.rej2Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(b.rej2Rate)}</div>
-                <div className="d"><Delta a={a.rej2Rate} b={b.rej2Rate} higherIsBetter={false} fmt={pctPts} /></div>
-              </div>
-              <div className="metric">
-                <div className="k">Dead seat-hours</div>
-                <div className="v mono" style={{ color: b.deadSeatHours > 1 ? "#B5432B" : "#172422" }}>{b.deadSeatHours.toFixed(1)}</div>
-              </div>
-              <div className="metric">
-                <div className="k">Bumped seat-hours</div>
-                <div className="v mono" style={{ color: b.bumpedSeatHours > 0.1 ? "#B5432B" : "#172422" }}>{b.bumpedSeatHours.toFixed(1)}</div>
+                <div className="v mono" style={{ color: model2.rej2Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(model2.rej2Rate)}</div>
+                <div className="d"><Delta a={model1.rej2Rate} b={model2.rej2Rate} higherIsBetter={false} fmt={pctPts} /></div>
               </div>
             </div>
             <h2>Average seats occupied per half hour</h2>
-            <Heatmap avgOcc={b.avgOcc} seats={seats} />
+            <Heatmap avgOcc={model2.avgOcc} seats={seats} />
           </div>
         </div>
       </div>
 
       <div style={{ maxWidth: 1320, margin: "18px auto 0" }}>
         <p className="note">
-          Deltas are advanced model minus basic model, coloured green when the change is favourable
+          Deltas are Model 2 minus Model 1, coloured green when the change is favourable
           (higher utilisation, fewer rejections) and orange when unfavourable. Because both columns
           share one random seed and the same demand/policy inputs, any difference you see comes purely
-          from the advanced levers — cancellations, overbooking, reserve release, and the flexibility
-          incentive — not from re-randomised demand.
+          from the different capacity allocation strategies — the 50/50 stream constraint vs flexible utilisation.
         </p>
       </div>
     </div>
