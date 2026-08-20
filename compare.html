@@ -86,14 +86,47 @@ function prefWeights(maxStart, peakBias) {
   return w;
 }
 
-function sampleIdx(weights, rand) {
+function sampleIdxFrom(weights, roll) {
   const total = weights.reduce((a, c) => a + c, 0);
-  let r = rand() * total;
+  let r = roll * total;
   for (let i = 0; i < weights.length; i++) {
     r -= weights[i];
     if (r <= 0) return i;
   }
   return weights.length - 1;
+}
+
+function sampleIdx(weights, rand) {
+  return sampleIdxFrom(weights, rand());
+}
+
+// One day of demand, generated once and handed to both models so they face exactly the same
+// customers in the same order. Every random choice a customer makes (length, flexibility, preferred
+// time, whether they cancel and rebook) is drawn here, so a model that rejects or cancels more often
+// cannot pull the two simulations out of step. The spare customers back any rebooking a model triggers.
+function buildDemand(p, seed) {
+  const rand = mulberry32(seed);
+  const customers = [];
+  for (let k = 0; k < p.demand * 2; k++) {
+    customers.push({
+      dur: rand() < p.twoHourShare / 100 ? 4 : 2,
+      flexible: rand() < p.lastMinuteShare / 100,
+      prefRoll: rand(),
+      cancelRoll: rand(),
+      whenRoll: rand(),
+      rebookRoll: rand(),
+    });
+  }
+  const today = customers.slice(0, p.demand);
+  const planners = today.filter((c) => !c.flexible);
+  const flex = today.filter((c) => c.flexible);
+  shuffle(planners, rand);
+  shuffle(flex, rand);
+  return { ordered: [...planners, ...flex], spare: customers.slice(p.demand) };
+}
+
+function demandSeed(seed, dayIndex) {
+  return (seed * 7919 + dayIndex) | 0;
 }
 
 function validStarts(dur, hourAlign) {
@@ -128,27 +161,31 @@ function attendance(bookings, p) {
 // Cancellations hand the seat back part-way through the booking window, so later customers can take
 // it; a share of the customers who cancel come back with a fresh request of their own
 class CancelBook {
-  constructor(rand, p) {
-    this.rand = rand;
+  constructor(p, spare) {
     this.p = p;
+    this.spare = spare;
+    this.taken = 0;
     this.due = new Map();
     this.late = [];
     this.count = 0;
   }
 
   maybeCancel(k, c, booking, queue) {
-    if (this.rand() >= this.p.cancelRate / 100) return;
+    if (c.cancelRoll >= this.p.cancelRate / 100) return;
     this.count++;
     const horizon = queue.length;
-    const at = k + 1 + Math.floor(this.rand() * Math.max(1, horizon - k));
+    const at = k + 1 + Math.floor(c.whenRoll * Math.max(1, horizon - k));
     if (at < horizon) {
       if (!this.due.has(at)) this.due.set(at, []);
       this.due.get(at).push(booking);
     } else {
       this.late.push(booking);
     }
-    const rebooks = this.rand() < this.p.rebookShare / 100;
-    if (rebooks && horizon < this.p.demand * 2) queue.push({ dur: c.dur, flexible: c.flexible });
+    const replacement = this.spare[this.taken];
+    if (c.rebookRoll < this.p.rebookShare / 100 && replacement) {
+      this.taken++;
+      queue.push({ ...replacement, dur: c.dur, flexible: c.flexible });
+    }
   }
 
   release(b) {
@@ -248,38 +285,25 @@ function simulateBasic(p, seed) {
 }
 
 // ---------- Model 1: Flow optimised (50/50 stream constraint) ----------
-function runTrialFlowOptimised(p, rand, dayIndex = 0) {
+function runTrialFlowOptimised(p, demand, dayIndex = 0) {
   const { day, date } = bookingDay(dayIndex);
   // Streams are start times, not durations: one cohort starts on the hour, the other at :30.
   // Each cohort has its own seats, so occupancy is tracked per cohort.
   const occOnHour = new Array(INTERVALS).fill(0);
   const occOnHalf = new Array(INTERVALS).fill(0);
-  const n = p.demand;
   
   // Separate capacity into two streams (handle odd seat counts), including any overbooking allowance
   const capBase = p.seats + p.overbook;
   const hourStartCap = Math.ceil(capBase * 0.5); // 50% for bookings starting on the hour (round up)
   const halfStartCap = capBase - hourStartCap; // Remaining for bookings starting at :30
   
-  const customers = [];
-  for (let k = 0; k < n; k++) {
-    customers.push({
-      dur: rand() < p.twoHourShare / 100 ? 4 : 2,
-      flexible: rand() < p.lastMinuteShare / 100,
-    });
-  }
-  
-  const planners = customers.filter((c) => !c.flexible);
-  const flex = customers.filter((c) => c.flexible);
-  shuffle(planners, rand);
-  shuffle(flex, rand);
-  const ordered = [...planners, ...flex];
+  const ordered = [...demand.ordered];
   
   const weightsCache = {};
   const startsCache = { 2: validStarts(2, p.hourAlign), 4: validStarts(4, p.hourAlign) };
   const req = { 2: 0, 4: 0 };
   const rej = { 2: 0, 4: 0 };
-  const cancels = new CancelBook(rand, p);
+  const cancels = new CancelBook(p, demand.spare);
   
   const results = [];
   const booked = [];
@@ -295,7 +319,7 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
     const maxStart = INTERVALS - c.dur;
     
     if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
-    const pref = sampleIdx(weightsCache[c.dur], rand);
+    const pref = sampleIdxFrom(weightsCache[c.dur], c.prefRoll);
     
     const feasible = (s) => {
       const occ = poolOf(s), cap = capOf(s);
@@ -344,14 +368,13 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
 }
 
 function simulateFlowOptimised(p, seed) {
-  const rand = mulberry32(seed);
   const occSum = new Array(INTERVALS).fill(0);
   let used = 0, turnedAway = 0, turnedAwayHours = 0, cancelled = 0, seated = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
   let allResults = [];
   const totalCapacity = p.seats * INTERVALS;
   
   for (let t = 0; t < TRIALS; t++) {
-    const r = runTrialFlowOptimised(p, rand, t);
+    const r = runTrialFlowOptimised(p, buildDemand(p, demandSeed(seed, t)), t);
     r.occ.forEach((v, i) => (occSum[i] += v));
     used += r.used; turnedAway += r.turnedAway; turnedAwayHours += r.turnedAwaySeatHours; cancelled += r.cancelled;
     seated += r.results.filter((x) => x.outcome === 'Attended').length;
@@ -375,32 +398,19 @@ function simulateFlowOptimised(p, seed) {
 }
 
 // ---------- Model 2: Utilisation optimised (no stream constraint) ----------
-function runTrialUtilisationOptimised(p, rand, dayIndex = 0) {
+function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
   const { day, date } = bookingDay(dayIndex);
   const occ = new Array(INTERVALS).fill(0);
-  const n = p.demand;
   const capBase = p.seats + p.overbook;
   
   // No 50/50 constraint - use full capacity for both streams
-  const customers = [];
-  for (let k = 0; k < n; k++) {
-    customers.push({
-      dur: rand() < p.twoHourShare / 100 ? 4 : 2,
-      flexible: rand() < p.lastMinuteShare / 100,
-    });
-  }
-  
-  const planners = customers.filter((c) => !c.flexible);
-  const flex = customers.filter((c) => c.flexible);
-  shuffle(planners, rand);
-  shuffle(flex, rand);
-  const ordered = [...planners, ...flex];
+  const ordered = [...demand.ordered];
   
   const weightsCache = {};
   const startsCache = { 2: validStarts(2, p.hourAlign), 4: validStarts(4, p.hourAlign) };
   const req = { 2: 0, 4: 0 };
   const rej = { 2: 0, 4: 0 };
-  const cancels = new CancelBook(rand, p);
+  const cancels = new CancelBook(p, demand.spare);
   
   const results = [];
   const booked = [];
@@ -414,7 +424,7 @@ function runTrialUtilisationOptimised(p, rand, dayIndex = 0) {
     const maxStart = INTERVALS - c.dur;
     
     if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
-    const pref = sampleIdx(weightsCache[c.dur], rand);
+    const pref = sampleIdxFrom(weightsCache[c.dur], c.prefRoll);
     
     const feasible = (s) => {
       for (let i = s; i < s + c.dur; i++) if (occ[i] + 1 > cap) return false;
@@ -459,12 +469,11 @@ function runTrialUtilisationOptimised(p, rand, dayIndex = 0) {
 }
 
 function simulateUtilisationOptimised(p, seed) {
-  const rand = mulberry32(seed);
   const occSum = new Array(INTERVALS).fill(0);
   let used = 0, turnedAway = 0, turnedAwayHours = 0, cancelled = 0, seated = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
   let allResults = [];
   for (let t = 0; t < TRIALS; t++) {
-    const r = runTrialUtilisationOptimised(p, rand, t);
+    const r = runTrialUtilisationOptimised(p, buildDemand(p, demandSeed(seed, t)), t);
     r.occ.forEach((v, i) => (occSum[i] += v));
     used += r.used; turnedAway += r.turnedAway; turnedAwayHours += r.turnedAwaySeatHours; cancelled += r.cancelled;
     seated += r.results.filter((x) => x.outcome === 'Attended').length;
@@ -658,10 +667,9 @@ function Toggle({ label, on, onChange, tip }) {
 
 // Booking success rate for one seat count, using fewer trials than the headline metrics
 function sweepSuccessRate(runTrial, p, seed) {
-  const rand = mulberry32(seed);
   let req = 0, rej = 0;
   for (let t = 0; t < SWEEP_TRIALS; t++) {
-    const r = runTrial(p, rand);
+    const r = runTrial(p, buildDemand(p, demandSeed(seed, t)));
     req += r.req[2] + r.req[4];
     rej += r.rej[2] + r.rej[4];
   }
@@ -793,11 +801,11 @@ function App() {
 
   // One trial per model for each trading day in the two-week window
   const days = useMemo(() => {
-    const rand = mulberry32(seed);
     const out = [];
     for (let d = 0; d < SAMPLE_DAYS; d++) {
-      const t1 = runTrialFlowOptimised(shared, rand, d);
-      const t2 = runTrialUtilisationOptimised(shared, rand, d);
+      const demand = buildDemand(shared, demandSeed(seed, d));
+      const t1 = runTrialFlowOptimised(shared, demand, d);
+      const t2 = runTrialUtilisationOptimised(shared, demand, d);
       out.push({
         ...bookingDay(d),
         occ1: t1.seatedOcc,
