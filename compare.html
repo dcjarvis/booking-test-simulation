@@ -105,6 +105,58 @@ function validStarts(dur, hourAlign) {
   return out;
 }
 
+// Seats actually sat in, and bookings turned away on the day because overbooking oversold the room
+function attendance(occ, p) {
+  let used = 0, bumped = 0;
+  for (const v of occ) {
+    used += Math.min(v, p.seats);
+    bumped += Math.max(0, v - p.seats);
+  }
+  return { used, bumped };
+}
+
+// Cancellations hand the seat back part-way through the booking window, so later customers can take
+// it; a share of the customers who cancel come back with a fresh request of their own
+class CancelBook {
+  constructor(rand, p) {
+    this.rand = rand;
+    this.p = p;
+    this.due = new Map();
+    this.late = [];
+    this.count = 0;
+  }
+
+  maybeCancel(k, c, pool, start, queue) {
+    if (this.rand() >= this.p.cancelRate / 100) return;
+    this.count++;
+    const horizon = queue.length;
+    const at = k + 1 + Math.floor(this.rand() * Math.max(1, horizon - k));
+    const entry = [pool, start, c.dur];
+    if (at < horizon) {
+      if (!this.due.has(at)) this.due.set(at, []);
+      this.due.get(at).push(entry);
+    } else {
+      this.late.push(entry);
+    }
+    const rebooks = this.rand() < this.p.rebookShare / 100;
+    if (rebooks && horizon < this.p.demand * 2) queue.push({ dur: c.dur, flexible: c.flexible });
+  }
+
+  releaseDue(k) {
+    const list = this.due.get(k);
+    if (!list) return;
+    for (const [pool, s, dur] of list) for (let i = s; i < s + dur; i++) pool[i]--;
+    this.due.delete(k);
+  }
+
+  // seats freed too late for anyone else to take them still empty out on the day
+  releaseRemaining() {
+    for (const k of [...this.due.keys()]) this.releaseDue(k);
+    for (const [pool, s, dur] of this.late) for (let i = s; i < s + dur; i++) pool[i]--;
+    this.late = [];
+  }
+}
+
 // ---------- model A: basic (index.html) ----------
 function runTrialBasic(p, rand) {
   const occ = new Array(INTERVALS).fill(0);
@@ -189,9 +241,10 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
   const occOnHalf = new Array(INTERVALS).fill(0);
   const n = p.demand;
   
-  // Separate capacity into two streams (handle odd seat counts)
-  const hourStartCap = Math.ceil(p.seats * 0.5); // 50% for bookings starting on the hour (round up)
-  const halfStartCap = p.seats - hourStartCap; // Remaining for bookings starting at :30
+  // Separate capacity into two streams (handle odd seat counts), including any overbooking allowance
+  const capBase = p.seats + p.overbook;
+  const hourStartCap = Math.ceil(capBase * 0.5); // 50% for bookings starting on the hour (round up)
+  const halfStartCap = capBase - hourStartCap; // Remaining for bookings starting at :30
   
   const customers = [];
   for (let k = 0; k < n; k++) {
@@ -211,10 +264,13 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
   const startsCache = { 2: validStarts(2, p.hourAlign), 4: validStarts(4, p.hourAlign) };
   const req = { 2: 0, 4: 0 };
   const rej = { 2: 0, 4: 0 };
+  const cancels = new CancelBook(rand, p);
   
   const results = [];
   
-  for (const c of ordered) {
+  for (let k = 0; k < ordered.length; k++) {
+    cancels.releaseDue(k);
+    const c = ordered[k];
     req[c.dur]++;
     // A booking draws on the cohort matching its start time, for its whole length
     // (reserve applies to 1-hour bookings only)
@@ -258,30 +314,27 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
     
     const picked = poolOf(pick);
     for (let i = pick; i < pick + c.dur; i++) picked[i]++;
+    cancels.maybeCancel(k, c, picked, pick, ordered);
+    
     results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, startTime: timeLabel(pick), model: 'Flow Optimised' });
   }
   
+  cancels.releaseRemaining();
   const occ = occOnHour.map((v, i) => v + occOnHalf[i]);
-  const used = occ.reduce((a, c) => a + c, 0);
-  return { occ, used, req, rej, results };
+  return { occ, ...attendance(occ, p), cancelled: cancels.count, req, rej, results };
 }
 
 function simulateFlowOptimised(p, seed) {
   const rand = mulberry32(seed);
   const occSum = new Array(INTERVALS).fill(0);
-  let used = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
+  let used = 0, bumped = 0, cancelled = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
   let allResults = [];
-  
-  // Calculate actual available capacity for fair utilisation comparison
-  const hourStartCap = Math.ceil(p.seats * 0.5);
-  const halfStartCap = p.seats - hourStartCap;
-  // Account for reserve in capacity calculation
-  const totalCapacity = (hourStartCap + halfStartCap - p.reserve) * INTERVALS;
+  const totalCapacity = p.seats * INTERVALS;
   
   for (let t = 0; t < TRIALS; t++) {
     const r = runTrialFlowOptimised(p, rand, t);
     r.occ.forEach((v, i) => (occSum[i] += v));
-    used += r.used;
+    used += r.used; bumped += r.bumped; cancelled += r.cancelled;
     req1 += r.req[2]; req2 += r.req[4];
     rej1 += r.rej[2]; rej2 += r.rej[4];
     allResults = allResults.concat(r.results);
@@ -290,6 +343,8 @@ function simulateFlowOptimised(p, seed) {
     avgOcc: occSum.map((v) => v / TRIALS),
     utilisation: used / TRIALS / totalCapacity,
     soldSeatHours: used / TRIALS / 2,
+    bumpedSeatHours: bumped / TRIALS / 2,
+    cancellations: cancelled / TRIALS,
     rej1Rate: req1 ? rej1 / req1 : 0,
     rej2Rate: req2 ? rej2 / req2 : 0,
     successRate: req1 + req2 ? 1 - (rej1 + rej2) / (req1 + req2) : 0,
@@ -302,6 +357,7 @@ function runTrialUtilisationOptimised(p, rand, dayIndex = 0) {
   const { day, date } = bookingDay(dayIndex);
   const occ = new Array(INTERVALS).fill(0);
   const n = p.demand;
+  const capBase = p.seats + p.overbook;
   
   // No 50/50 constraint - use full capacity for both streams
   const customers = [];
@@ -322,13 +378,16 @@ function runTrialUtilisationOptimised(p, rand, dayIndex = 0) {
   const startsCache = { 2: validStarts(2, p.hourAlign), 4: validStarts(4, p.hourAlign) };
   const req = { 2: 0, 4: 0 };
   const rej = { 2: 0, 4: 0 };
+  const cancels = new CancelBook(rand, p);
   
   const results = [];
   
-  for (const c of ordered) {
+  for (let k = 0; k < ordered.length; k++) {
+    cancels.releaseDue(k);
+    const c = ordered[k];
     req[c.dur]++;
     // Use full capacity for both durations (reserve applies to 1-hour bookings only, consistent with basic model)
-    const cap = c.dur === 2 ? p.seats - p.reserve : p.seats;
+    const cap = c.dur === 2 ? capBase - p.reserve : capBase;
     const maxStart = INTERVALS - c.dur;
     
     if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
@@ -364,22 +423,23 @@ function runTrialUtilisationOptimised(p, rand, dayIndex = 0) {
     }
     
     for (let i = pick; i < pick + c.dur; i++) occ[i]++;
+    cancels.maybeCancel(k, c, occ, pick, ordered);
     results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, startTime: timeLabel(pick), model: 'Utilisation Optimised' });
   }
   
-  const used = occ.reduce((a, c) => a + c, 0);
-  return { occ, used, req, rej, results };
+  cancels.releaseRemaining();
+  return { occ, ...attendance(occ, p), cancelled: cancels.count, req, rej, results };
 }
 
 function simulateUtilisationOptimised(p, seed) {
   const rand = mulberry32(seed);
   const occSum = new Array(INTERVALS).fill(0);
-  let used = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
+  let used = 0, bumped = 0, cancelled = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
   let allResults = [];
   for (let t = 0; t < TRIALS; t++) {
     const r = runTrialUtilisationOptimised(p, rand, t);
     r.occ.forEach((v, i) => (occSum[i] += v));
-    used += r.used;
+    used += r.used; bumped += r.bumped; cancelled += r.cancelled;
     req1 += r.req[2]; req2 += r.req[4];
     rej1 += r.rej[2]; rej2 += r.rej[4];
     allResults = allResults.concat(r.results);
@@ -388,6 +448,8 @@ function simulateUtilisationOptimised(p, seed) {
     avgOcc: occSum.map((v) => v / TRIALS),
     utilisation: used / TRIALS / (p.seats * INTERVALS),
     soldSeatHours: used / TRIALS / 2,
+    bumpedSeatHours: bumped / TRIALS / 2,
+    cancellations: cancelled / TRIALS,
     rej1Rate: req1 ? rej1 / req1 : 0,
     rej2Rate: req2 ? rej2 / req2 : 0,
     successRate: req1 + req2 ? 1 - (rej1 + rej2) / (req1 + req2) : 0,
@@ -673,17 +735,17 @@ function App() {
   const [hourAlign, setHourAlign] = useState(true);
   const [smart, setSmart] = useState(true);
   const [reserve, setReserve] = useState(0);
+  const [overbook, setOverbook] = useState(0);
+  const [cancelRate, setCancelRate] = useState(0);
+  const [rebookShare, setRebookShare] = useState(0);
 
   const [seed, setSeed] = useState(1);
 
-  const shared = { seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve };
+  const shared = { seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve, overbook, cancelRate, rebookShare };
+  const inputs = [seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve, overbook, cancelRate, rebookShare, seed];
 
-  const model1 = useMemo(() => simulateFlowOptimised(shared, seed), [
-    seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve, seed,
-  ]);
-  const model2 = useMemo(() => simulateUtilisationOptimised(shared, seed), [
-    seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve, seed,
-  ]);
+  const model1 = useMemo(() => simulateFlowOptimised(shared, seed), inputs);
+  const model2 = useMemo(() => simulateUtilisationOptimised(shared, seed), inputs);
 
   const pct = (v) => (v * 100).toFixed(1) + "%";
   const pctPts = (v) => (v * 100).toFixed(1) + "pp";
@@ -703,13 +765,11 @@ function App() {
       });
     }
     return out;
-  }, [seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve, seed]);
+  }, inputs);
 
   const allResults = useMemo(() => days.flatMap((d) => d.results), [days]);
 
-  const seatsSweep = useMemo(() => sweepSeats(shared, seed), [
-    demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve, seed,
-  ]);
+  const seatsSweep = useMemo(() => sweepSeats(shared, seed), inputs);
 
   // where Model 2's lead peaks, and where it has all but closed again
   const peakPoint = seatsSweep.reduce((a, p) => (Math.abs(p.s2 - p.s1) > Math.abs(a.s2 - a.s1) ? p : a), seatsSweep[0]);
@@ -878,6 +938,11 @@ function App() {
           </div>
           <Slider label="Seats reserved for 2h bookings" value={reserve} onChange={setReserve} min={0} max={10} />
 
+          <h2 style={{ marginTop: 18 }}>Advanced: overbooking &amp; cancellations</h2>
+          <Slider label="Overbooking per half-hour slot" value={overbook} onChange={setOverbook} min={0} max={10} />
+          <Slider label="Cancellation rate" value={cancelRate} onChange={setCancelRate} min={0} max={50} unit="%" />
+          <Slider label="Cancelled bookings that rebook" value={rebookShare} onChange={setRebookShare} min={0} max={100} unit="%" />
+
           <button className="reroll" onClick={() => setSeed((s) => s + 1)}>Re-run with new randomness</button>
         </div>
 
@@ -897,6 +962,14 @@ function App() {
               <div className="metric">
                 <div className="k">Sold seat-hours</div>
                 <div className="v mono">{model1.soldSeatHours.toFixed(0)}</div>
+              </div>
+              <div className="metric">
+                <div className="k">Cancellations / day</div>
+                <div className="v mono">{model1.cancellations.toFixed(0)}</div>
+              </div>
+              <div className="metric">
+                <div className="k">Overbooked seat-hours</div>
+                <div className="v mono" style={{ color: model1.bumpedSeatHours > 0 ? "#B5432B" : "#172422" }}>{model1.bumpedSeatHours.toFixed(0)}</div>
               </div>
               <div className="metric">
                 <div className="k">1h rejections</div>
@@ -931,6 +1004,16 @@ function App() {
                 <div className="k">Sold seat-hours</div>
                 <div className="v mono">{model2.soldSeatHours.toFixed(0)}</div>
                 <div className="d"><Delta a={model1.soldSeatHours} b={model2.soldSeatHours} fmt={(v) => v.toFixed(0)} /></div>
+              </div>
+              <div className="metric">
+                <div className="k">Cancellations / day</div>
+                <div className="v mono">{model2.cancellations.toFixed(0)}</div>
+                <div className="d"><Delta a={model1.cancellations} b={model2.cancellations} higherIsBetter={false} fmt={(v) => v.toFixed(0)} /></div>
+              </div>
+              <div className="metric">
+                <div className="k">Overbooked seat-hours</div>
+                <div className="v mono" style={{ color: model2.bumpedSeatHours > 0 ? "#B5432B" : "#172422" }}>{model2.bumpedSeatHours.toFixed(0)}</div>
+                <div className="d"><Delta a={model1.bumpedSeatHours} b={model2.bumpedSeatHours} higherIsBetter={false} fmt={(v) => v.toFixed(0)} /></div>
               </div>
               <div className="metric">
                 <div className="k">1h rejections</div>
