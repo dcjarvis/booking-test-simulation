@@ -105,14 +105,24 @@ function validStarts(dur, hourAlign) {
   return out;
 }
 
-// Seats actually sat in, and bookings turned away on the day because overbooking oversold the room
-function attendance(occ, p) {
-  let used = 0, bumped = 0;
-  for (const v of occ) {
-    used += Math.min(v, p.seats);
-    bumped += Math.max(0, v - p.seats);
+// Walk the day forwards and seat people as they arrive. Overbooking can sell more places than the
+// room holds, so an arrival that finds every seat taken is turned away and loses its whole booking.
+// A booking only ever needs checking at its start: later arrivals test the seat count again.
+function attendance(bookings, p) {
+  const seated = new Array(INTERVALS).fill(0);
+  let turnedAway = 0, turnedAwaySeatHours = 0;
+  for (const b of [...bookings].sort((a, b2) => a.start - b2.start)) {
+    if (!b.live) continue;
+    if (seated[b.start] >= p.seats) {
+      turnedAway++;
+      turnedAwaySeatHours += b.dur;
+      b.row.outcome = 'Turned away';
+      continue;
+    }
+    for (let i = b.start; i < b.start + b.dur; i++) seated[i]++;
+    b.row.outcome = 'Attended';
   }
-  return { used, bumped };
+  return { used: seated.reduce((a, v) => a + v, 0), turnedAway, turnedAwaySeatHours };
 }
 
 // Cancellations hand the seat back part-way through the booking window, so later customers can take
@@ -126,33 +136,38 @@ class CancelBook {
     this.count = 0;
   }
 
-  maybeCancel(k, c, pool, start, queue) {
+  maybeCancel(k, c, booking, queue) {
     if (this.rand() >= this.p.cancelRate / 100) return;
     this.count++;
     const horizon = queue.length;
     const at = k + 1 + Math.floor(this.rand() * Math.max(1, horizon - k));
-    const entry = [pool, start, c.dur];
     if (at < horizon) {
       if (!this.due.has(at)) this.due.set(at, []);
-      this.due.get(at).push(entry);
+      this.due.get(at).push(booking);
     } else {
-      this.late.push(entry);
+      this.late.push(booking);
     }
     const rebooks = this.rand() < this.p.rebookShare / 100;
     if (rebooks && horizon < this.p.demand * 2) queue.push({ dur: c.dur, flexible: c.flexible });
   }
 
+  release(b) {
+    b.live = false;
+    b.row.outcome = 'Cancelled';
+    for (let i = b.start; i < b.start + b.dur; i++) b.pool[i]--;
+  }
+
   releaseDue(k) {
     const list = this.due.get(k);
     if (!list) return;
-    for (const [pool, s, dur] of list) for (let i = s; i < s + dur; i++) pool[i]--;
+    for (const b of list) this.release(b);
     this.due.delete(k);
   }
 
   // seats freed too late for anyone else to take them still empty out on the day
   releaseRemaining() {
     for (const k of [...this.due.keys()]) this.releaseDue(k);
-    for (const [pool, s, dur] of this.late) for (let i = s; i < s + dur; i++) pool[i]--;
+    for (const b of this.late) this.release(b);
     this.late = [];
   }
 }
@@ -267,6 +282,7 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
   const cancels = new CancelBook(rand, p);
   
   const results = [];
+  const booked = [];
   
   for (let k = 0; k < ordered.length; k++) {
     cancels.releaseDue(k);
@@ -295,7 +311,7 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
     }
     
     if (candidates.length === 0) { rej[c.dur]++; 
-      results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, startTime: null, model: 'Flow Optimised' });
+      results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, outcome: 'Rejected', startTime: null, model: 'Flow Optimised' });
       continue; }
     
     let pick;
@@ -314,27 +330,31 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
     
     const picked = poolOf(pick);
     for (let i = pick; i < pick + c.dur; i++) picked[i]++;
-    cancels.maybeCancel(k, c, picked, pick, ordered);
-    
-    results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, startTime: timeLabel(pick), model: 'Flow Optimised' });
+
+    const row = { day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, outcome: 'Attended', startTime: timeLabel(pick), model: 'Flow Optimised' };
+    results.push(row);
+    const booking = { pool: picked, start: pick, dur: c.dur, row, live: true };
+    booked.push(booking);
+    cancels.maybeCancel(k, c, booking, ordered);
   }
   
   cancels.releaseRemaining();
   const occ = occOnHour.map((v, i) => v + occOnHalf[i]);
-  return { occ, ...attendance(occ, p), cancelled: cancels.count, req, rej, results };
+  return { occ, ...attendance(booked, p), cancelled: cancels.count, req, rej, results };
 }
 
 function simulateFlowOptimised(p, seed) {
   const rand = mulberry32(seed);
   const occSum = new Array(INTERVALS).fill(0);
-  let used = 0, bumped = 0, cancelled = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
+  let used = 0, turnedAway = 0, turnedAwayHours = 0, cancelled = 0, seated = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
   let allResults = [];
   const totalCapacity = p.seats * INTERVALS;
   
   for (let t = 0; t < TRIALS; t++) {
     const r = runTrialFlowOptimised(p, rand, t);
     r.occ.forEach((v, i) => (occSum[i] += v));
-    used += r.used; bumped += r.bumped; cancelled += r.cancelled;
+    used += r.used; turnedAway += r.turnedAway; turnedAwayHours += r.turnedAwaySeatHours; cancelled += r.cancelled;
+    seated += r.results.filter((x) => x.outcome === 'Attended').length;
     req1 += r.req[2]; req2 += r.req[4];
     rej1 += r.rej[2]; rej2 += r.rej[4];
     allResults = allResults.concat(r.results);
@@ -343,7 +363,9 @@ function simulateFlowOptimised(p, seed) {
     avgOcc: occSum.map((v) => v / TRIALS),
     utilisation: used / TRIALS / totalCapacity,
     soldSeatHours: used / TRIALS / 2,
-    bumpedSeatHours: bumped / TRIALS / 2,
+    turnedAway: turnedAway / TRIALS,
+    turnedAwayRate: turnedAway + seated ? turnedAway / (turnedAway + seated) : 0,
+    turnedAwaySeatHours: turnedAwayHours / TRIALS / 2,
     cancellations: cancelled / TRIALS,
     rej1Rate: req1 ? rej1 / req1 : 0,
     rej2Rate: req2 ? rej2 / req2 : 0,
@@ -381,6 +403,7 @@ function runTrialUtilisationOptimised(p, rand, dayIndex = 0) {
   const cancels = new CancelBook(rand, p);
   
   const results = [];
+  const booked = [];
   
   for (let k = 0; k < ordered.length; k++) {
     cancels.releaseDue(k);
@@ -406,7 +429,7 @@ function runTrialUtilisationOptimised(p, rand, dayIndex = 0) {
     }
     
     if (candidates.length === 0) { rej[c.dur]++; 
-      results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, startTime: null, model: 'Utilisation Optimised' });
+      results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, outcome: 'Rejected', startTime: null, model: 'Utilisation Optimised' });
       continue; }
     
     let pick;
@@ -423,23 +446,28 @@ function runTrialUtilisationOptimised(p, rand, dayIndex = 0) {
     }
     
     for (let i = pick; i < pick + c.dur; i++) occ[i]++;
-    cancels.maybeCancel(k, c, occ, pick, ordered);
-    results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, startTime: timeLabel(pick), model: 'Utilisation Optimised' });
+
+    const row = { day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, outcome: 'Attended', startTime: timeLabel(pick), model: 'Utilisation Optimised' };
+    results.push(row);
+    const booking = { pool: occ, start: pick, dur: c.dur, row, live: true };
+    booked.push(booking);
+    cancels.maybeCancel(k, c, booking, ordered);
   }
   
   cancels.releaseRemaining();
-  return { occ, ...attendance(occ, p), cancelled: cancels.count, req, rej, results };
+  return { occ, ...attendance(booked, p), cancelled: cancels.count, req, rej, results };
 }
 
 function simulateUtilisationOptimised(p, seed) {
   const rand = mulberry32(seed);
   const occSum = new Array(INTERVALS).fill(0);
-  let used = 0, bumped = 0, cancelled = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
+  let used = 0, turnedAway = 0, turnedAwayHours = 0, cancelled = 0, seated = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
   let allResults = [];
   for (let t = 0; t < TRIALS; t++) {
     const r = runTrialUtilisationOptimised(p, rand, t);
     r.occ.forEach((v, i) => (occSum[i] += v));
-    used += r.used; bumped += r.bumped; cancelled += r.cancelled;
+    used += r.used; turnedAway += r.turnedAway; turnedAwayHours += r.turnedAwaySeatHours; cancelled += r.cancelled;
+    seated += r.results.filter((x) => x.outcome === 'Attended').length;
     req1 += r.req[2]; req2 += r.req[4];
     rej1 += r.rej[2]; rej2 += r.rej[4];
     allResults = allResults.concat(r.results);
@@ -448,7 +476,9 @@ function simulateUtilisationOptimised(p, seed) {
     avgOcc: occSum.map((v) => v / TRIALS),
     utilisation: used / TRIALS / (p.seats * INTERVALS),
     soldSeatHours: used / TRIALS / 2,
-    bumpedSeatHours: bumped / TRIALS / 2,
+    turnedAway: turnedAway / TRIALS,
+    turnedAwayRate: turnedAway + seated ? turnedAway / (turnedAway + seated) : 0,
+    turnedAwaySeatHours: turnedAwayHours / TRIALS / 2,
     cancellations: cancelled / TRIALS,
     rej1Rate: req1 ? rej1 / req1 : 0,
     rej2Rate: req2 ? rej2 / req2 : 0,
@@ -790,7 +820,7 @@ function App() {
 
   // Convert results to CSV
   const downloadCSV = () => {
-    const headers = ['Model', 'Day', 'Date', 'Duration', 'Flexible', 'Accepted', 'Start Time'];
+    const headers = ['Model', 'Day', 'Date', 'Duration', 'Flexible', 'Accepted', 'Outcome', 'Start Time'];
     const rows = allResults.map(r => [
       r.model,
       r.day,
@@ -798,6 +828,7 @@ function App() {
       r.duration,
       r.flexible ? 'Yes' : 'No',
       r.accepted ? 'Yes' : 'No',
+      r.outcome,
       r.startTime || 'N/A'
     ]);
     
@@ -968,8 +999,9 @@ function App() {
                 <div className="v mono">{model1.cancellations.toFixed(0)}</div>
               </div>
               <div className="metric">
-                <div className="k">Overbooked seat-hours</div>
-                <div className="v mono" style={{ color: model1.bumpedSeatHours > 0 ? "#B5432B" : "#172422" }}>{model1.bumpedSeatHours.toFixed(0)}</div>
+                <div className="k">Turned away on arrival / day</div>
+                <div className="v mono" style={{ color: model1.turnedAway > 0 ? "#B5432B" : "#172422" }}>{model1.turnedAway.toFixed(1)}</div>
+                <div className="d">{pct(model1.turnedAwayRate)} of people who turn up</div>
               </div>
               <div className="metric">
                 <div className="k">1h rejections</div>
@@ -1011,9 +1043,9 @@ function App() {
                 <div className="d"><Delta a={model1.cancellations} b={model2.cancellations} higherIsBetter={false} fmt={(v) => v.toFixed(0)} /></div>
               </div>
               <div className="metric">
-                <div className="k">Overbooked seat-hours</div>
-                <div className="v mono" style={{ color: model2.bumpedSeatHours > 0 ? "#B5432B" : "#172422" }}>{model2.bumpedSeatHours.toFixed(0)}</div>
-                <div className="d"><Delta a={model1.bumpedSeatHours} b={model2.bumpedSeatHours} higherIsBetter={false} fmt={(v) => v.toFixed(0)} /></div>
+                <div className="k">Turned away on arrival / day</div>
+                <div className="v mono" style={{ color: model2.turnedAway > 0 ? "#B5432B" : "#172422" }}>{model2.turnedAway.toFixed(1)}</div>
+                <div className="d"><Delta a={model1.turnedAway} b={model2.turnedAway} higherIsBetter={false} fmt={(v) => v.toFixed(1)} /> · {pct(model2.turnedAwayRate)} of people who turn up</div>
               </div>
               <div className="metric">
                 <div className="k">1h rejections</div>
@@ -1111,6 +1143,7 @@ function App() {
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Duration</th>
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Flexible</th>
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Accepted</th>
+                  <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Outcome</th>
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Start Time</th>
                 </tr>
               </thead>
@@ -1123,6 +1156,7 @@ function App() {
                     <td style={{ padding: "8px 12px" }}>{r.duration}</td>
                     <td style={{ padding: "8px 12px" }}>{r.flexible ? 'Yes' : 'No'}</td>
                     <td style={{ padding: "8px 12px", color: r.accepted ? "#0E5B4A" : "#B5432B" }}>{r.accepted ? 'Yes' : 'No'}</td>
+                    <td style={{ padding: "8px 12px", color: r.outcome === 'Attended' ? "#0E5B4A" : "#B5432B" }}>{r.outcome}</td>
                     <td style={{ padding: "8px 12px", fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" }}>{r.startTime || 'N/A'}</td>
                   </tr>
                 ))}
