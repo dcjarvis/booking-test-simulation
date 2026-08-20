@@ -635,15 +635,23 @@ function Slider({ label, value, onChange, min, max, step = 1, unit = "" }) {
   );
 }
 
+function InfoTip({ children }) {
+  return (
+    <span className="tipmark" tabIndex={0} aria-label="More information">
+      i
+      <span className="tip" role="tooltip">{children}</span>
+    </span>
+  );
+}
+
 function Toggle({ label, on, onChange, tip }) {
   return (
-    <span className="tipwrap">
+    <span className="togglerow">
       <button className={`toggle ${on ? "on" : ""}`} onClick={() => onChange(!on)} aria-pressed={on}>
         <span className="pip" />
         <span>{label}</span>
-        <span className="tipmark" aria-hidden="true">?</span>
       </button>
-      <span className="tip" role="tooltip">{tip}</span>
+      {tip && <InfoTip>{tip}</InfoTip>}
     </span>
   );
 }
@@ -897,13 +905,17 @@ function App() {
         .toggle .pip { width: 10px; height: 10px; border-radius: 50%; background: #D8DFDD; flex: none; }
         .toggle.on { border-color: #0E5B4A; background: #F2F7F5; }
         .toggle.on .pip { background: #0E5B4A; }
-        .toggle .tipmark { margin-left: auto; width: 16px; height: 16px; border-radius: 50%; flex: none;
-          background: #D8DFDD; color: #172422; font-size: 11px; font-weight: 700; line-height: 16px; text-align: center; }
-        .tipwrap { position: relative; display: block; }
-        .tipwrap .tip { position: absolute; left: 0; top: calc(100% + 6px); z-index: 30; width: 290px; max-width: 80vw;
-          padding: 10px 12px; border-radius: 8px; background: #172422; color: #fff; font-size: 12.5px; line-height: 1.5;
-          box-shadow: 0 6px 20px rgba(0,0,0,.22); opacity: 0; visibility: hidden; transition: opacity .12s ease; }
-        .tipwrap:hover .tip, .tipwrap:focus-within .tip { opacity: 1; visibility: visible; }
+        .togglerow { display: flex; align-items: center; gap: 8px; }
+        .togglerow .toggle { flex: 1; }
+        .tipmark { position: relative; flex: none; width: 18px; height: 18px; border-radius: 50%; background: #D8DFDD;
+          color: #172422; font: italic 700 12px/18px Georgia, serif; text-align: center; cursor: help; }
+        .tipmark:hover, .tipmark:focus-visible { background: #0E5B4A; color: #fff; outline: none; }
+        .tipmark .tip { position: absolute; right: -4px; top: calc(100% + 6px); z-index: 30; width: 280px; max-width: 78vw;
+          padding: 10px 12px; border-radius: 8px; background: #172422; color: #fff; text-align: left;
+          font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          font-style: normal; font-weight: 400; font-size: 12.5px; line-height: 1.5; box-shadow: 0 6px 20px rgba(0,0,0,.22);
+          opacity: 0; visibility: hidden; transition: opacity .12s ease; }
+        .tipmark:hover .tip, .tipmark:focus .tip { opacity: 1; visibility: visible; }
         .reroll { margin-top: 6px; width: 100%; padding: 9px; border-radius: 8px; border: 1px solid #172422;
           background: #172422; color: #fff; font: inherit; cursor: pointer; }
         .colhead { display: flex; align-items: center; justify-content: space-between; max-width: 1320px; margin: 0 auto; }
