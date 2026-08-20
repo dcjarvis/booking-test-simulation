@@ -635,13 +635,16 @@ function Slider({ label, value, onChange, min, max, step = 1, unit = "" }) {
   );
 }
 
-function Toggle({ label, on, onChange, hint }) {
+function Toggle({ label, on, onChange, tip }) {
   return (
-    <button className={`toggle ${on ? "on" : ""}`} onClick={() => onChange(!on)}
-      aria-pressed={on} title={hint}>
-      <span className="pip" />
-      <span>{label}</span>
-    </button>
+    <span className="tipwrap">
+      <button className={`toggle ${on ? "on" : ""}`} onClick={() => onChange(!on)} aria-pressed={on}>
+        <span className="pip" />
+        <span>{label}</span>
+        <span className="tipmark" aria-hidden="true">?</span>
+      </button>
+      <span className="tip" role="tooltip">{tip}</span>
+    </span>
   );
 }
 
@@ -894,6 +897,13 @@ function App() {
         .toggle .pip { width: 10px; height: 10px; border-radius: 50%; background: #D8DFDD; flex: none; }
         .toggle.on { border-color: #0E5B4A; background: #F2F7F5; }
         .toggle.on .pip { background: #0E5B4A; }
+        .toggle .tipmark { margin-left: auto; width: 16px; height: 16px; border-radius: 50%; flex: none;
+          background: #D8DFDD; color: #172422; font-size: 11px; font-weight: 700; line-height: 16px; text-align: center; }
+        .tipwrap { position: relative; display: block; }
+        .tipwrap .tip { position: absolute; left: 0; top: calc(100% + 6px); z-index: 30; width: 290px; max-width: 80vw;
+          padding: 10px 12px; border-radius: 8px; background: #172422; color: #fff; font-size: 12.5px; line-height: 1.5;
+          box-shadow: 0 6px 20px rgba(0,0,0,.22); opacity: 0; visibility: hidden; transition: opacity .12s ease; }
+        .tipwrap:hover .tip, .tipwrap:focus-within .tip { opacity: 1; visibility: visible; }
         .reroll { margin-top: 6px; width: 100%; padding: 9px; border-radius: 8px; border: 1px solid #172422;
           background: #172422; color: #fff; font: inherit; cursor: pointer; }
         .colhead { display: flex; align-items: center; justify-content: space-between; max-width: 1320px; margin: 0 auto; }
@@ -965,19 +975,22 @@ function App() {
           <h2 style={{ marginTop: 18 }}>Shared packing policy</h2>
           <div className="toggles">
             <Toggle label="2h slots start on the hour" on={hourAlign} onChange={setHourAlign}
-              hint="Restricts 2-hour bookings to 9:00, 10:00, 11:00…" />
+              tip={<span>
+                Long 2-hour tests are like big boxes on a shelf. When this is <b>on</b>, they may only start
+                at 9:00, 10:00, 11:00 and so on, so the boxes line up neatly and the small gaps that are left
+                are all the same size. When it is <b>off</b>, a 2-hour test can also start at half past, which
+                lets it slide into an odd gap, but it can also leave a stray half hour behind that nothing fits into.
+              </span>} />
             <Toggle label="Smart placement" on={smart} onChange={setSmart}
-              hint="Customers who don't mind when they come are put into the busiest half hour that still has a free seat, so empty seats stay together in one lump" />
+              tip={<span>
+                This is like filling a bus. Some customers don't mind what time they come. When it is <b>on</b>,
+                we sit those customers next to people who are already in, filling up the busiest half hours first.
+                That keeps all the leftover seats together in one big lump, and a big lump is the only thing a long
+                2-hour test can fit into. When it is <b>off</b>, we just give everyone the time closest to the one
+                they asked for, which sprinkles the empty seats all over the day in little gaps that nothing fits
+                into, so we end up saying no to more people even though the seats are there.
+              </span>} />
           </div>
-          <p className="note" style={{ marginTop: 8 }}>
-            <b>Smart placement</b> is like filling a bus. Some customers don't mind what time they come.
-            When it is <b>on</b>, we sit those customers next to people who are already in, filling up
-            the busiest half hours first. That keeps all the leftover seats together in one big lump,
-            and a big lump is the only thing a long 2-hour test can fit into. When it is <b>off</b>,
-            we just give everyone the time closest to the one they asked for, which sprinkles the empty
-            seats all over the day in little gaps that nothing fits into, so we end up saying no to
-            more people even though the seats are there.
-          </p>
           <Slider label="Seats reserved for 2h bookings" value={reserve} onChange={setReserve} min={0} max={10} />
 
           <h2 style={{ marginTop: 18 }}>Advanced: overbooking &amp; cancellations</h2>
