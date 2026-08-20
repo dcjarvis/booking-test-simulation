@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#0E5B4A">
   <title>Theory Test Seat Simulator</title>
   
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'><rect fill='%230E5B4A' width='180' height='180'/><text x='90' y='100' font-size='80' font-weight='bold' fill='white' text-anchor='middle' dy='.3em'>T</text></svg>">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'><rect fill='%230E5B4A' width='180' height='180'/><text x='90' y='100'[...]
   
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -278,7 +278,7 @@
               <div className="panel">
                 <h2>Demand scenario</h2>
                 <Slider label="Seats" value={seats} onChange={setSeats} min={10} max={60} />
-                <Slider label="Booking attempts / day" value={demand} onChange={setDemand} min={50} max={500} step={10} />
+                <Slider label="Booking attempts / day" value={demand} onChange={setDemand} min={50} max={1000000} step={10} />
                 <Slider label="2-hour share of requests" value={twoHourShare} onChange={setTwoHourShare} min={0} max={100} unit="%" />
                 <Slider label="Peak-time bias" value={peakBias} onChange={setPeakBias} min={0} max={100} unit="%" />
                 <Slider label="Last-minute share" value={lastMinuteShare} onChange={setLastMinuteShare} min={0} max={100} unit="%" />
