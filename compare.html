@@ -767,6 +767,16 @@ function DailyHeatmap({ days, occKey, seats }) {
   );
 }
 
+function Stat({ label, value, hint, alert = false, delta = null }) {
+  return (
+    <div className="metric" title={hint}>
+      <div className="k">{label}</div>
+      <div className="v mono" style={alert ? { color: "#B5432B" } : null}>{value}</div>
+      <div className="d">{delta}</div>
+    </div>
+  );
+}
+
 // The difference is taken between the figures as displayed, so two panels showing the same number
 // never report a change
 function Delta({ a, b, higherIsBetter = true, digits = 1, scale = 1, unit = "" }) {
@@ -945,11 +955,14 @@ function App() {
         .badge.flow { background: #E7ECEA; color: #45524F; }
         .badge.util { background: #0E5B4A; color: #fff; }
         .colnote { color: #6C7A77; font-size: 12px; margin-top: 4px; margin-bottom: 12px; max-width: 55ch; }
-        .metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 16px; }
-        .metric { background: #F7F9F8; border: 1px solid #E3E9E7; border-radius: 8px; padding: 10px 12px; }
-        .metric .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em; color: #6C7A77; font-weight: 600; }
-        .metric .v { font-size: 22px; font-weight: 650; margin-top: 2px; letter-spacing: -0.02em; }
-        .metric .d { margin-top: 2px; }
+        .metrics { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; margin-bottom: 16px; }
+        .metric { background: #F7F9F8; border: 1px solid #E3E9E7; border-radius: 8px; padding: 8px 5px; text-align: center; }
+        .metric .k { font-size: 9px; text-transform: uppercase; letter-spacing: 0.03em; color: #6C7A77;
+          font-weight: 600; line-height: 1.25; min-height: 23px; }
+        .metric .v { font-size: 17px; font-weight: 650; margin-top: 3px; letter-spacing: -0.02em; }
+        .metric .d { margin-top: 2px; min-height: 15px; }
+        .metric .delta { font-size: 11px; }
+        @media (max-width: 760px) { .metrics { grid-template-columns: repeat(4, 1fr); } }
         .delta { font-size: 12px; font-weight: 600; }
         .delta.up { color: #0E5B4A; }
         .delta.down { color: #B5432B; }
@@ -1034,35 +1047,20 @@ function App() {
           <p className="colnote">Separate fixed cohorts by start time: bookings starting on the hour and bookings starting at :30. Each stream has a maximum intake of 50% of available capacity. Combined theoretical ceiling of 100%.</p>
           <div className="panel">
             <div className="metrics">
-              <div className="metric">
-                <div className="k">Booking success rate</div>
-                <div className="v mono">{pct(model1.successRate)}</div>
-              </div>
-              <div className="metric">
-                <div className="k">Utilisation</div>
-                <div className="v mono">{pct(model1.utilisation)}</div>
-              </div>
-              <div className="metric">
-                <div className="k">Sold seat-hours, 2 weeks</div>
-                <div className="v mono">{fortnightSeatHours.m1.toFixed(0)}</div>
-              </div>
-              <div className="metric">
-                <div className="k">Cancellations / day</div>
-                <div className="v mono">{model1.cancellations.toFixed(0)}</div>
-              </div>
-              <div className="metric">
-                <div className="k">Turned away on arrival / day</div>
-                <div className="v mono" style={{ color: model1.turnedAway > 0 ? "#B5432B" : "#172422" }}>{model1.turnedAway.toFixed(1)}</div>
-                <div className="d">{pct(model1.turnedAwayRate)} of people who turn up</div>
-              </div>
-              <div className="metric">
-                <div className="k">1h rejections</div>
-                <div className="v mono" style={{ color: model1.rej1Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(model1.rej1Rate)}</div>
-              </div>
-              <div className="metric">
-                <div className="k">2h rejections</div>
-                <div className="v mono" style={{ color: model1.rej2Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(model1.rej2Rate)}</div>
-              </div>
+              <Stat label="Success rate" value={pct(model1.successRate)}
+                hint="Accepted requests as a share of all booking requests" />
+              <Stat label="Utilisation" value={pct(model1.utilisation)}
+                hint="Seats actually sat in, as a share of all seat time in the day" />
+              <Stat label="Seat-hours 2wk" value={fortnightSeatHours.m1.toFixed(0)}
+                hint="Seat-hours sold across the ten trading days shown below" />
+              <Stat label="Cancels / day" value={model1.cancellations.toFixed(0)}
+                hint="Bookings cancelled before the day, per day" />
+              <Stat label="Turned away / day" value={model1.turnedAway.toFixed(1)} alert={model1.turnedAway > 0}
+                hint={`People who turn up and find no seat, per day — ${pct(model1.turnedAwayRate)} of people who turn up`} />
+              <Stat label="1h rejected" value={pct(model1.rej1Rate)} alert={model1.rej1Rate > 0.02}
+                hint="Share of 1-hour requests that could not be placed" />
+              <Stat label="2h rejected" value={pct(model1.rej2Rate)} alert={model1.rej2Rate > 0.02}
+                hint="Share of 2-hour requests that could not be placed" />
             </div>
             <h2>Seats filled per half hour, by day</h2>
             <DailyHeatmap days={days} occKey="occ1" seats={seats} />
@@ -1077,41 +1075,27 @@ function App() {
           <p className="colnote">No 50/50 stream constraint. Bookings are accepted based on available capacity and the algorithm tries to maximise utilisation. The hour/half-hour mix can flex based on demand.</p>
           <div className="panel">
             <div className="metrics">
-              <div className="metric">
-                <div className="k">Booking success rate</div>
-                <div className="v mono">{pct(model2.successRate)}</div>
-                <div className="d"><Delta a={model1.successRate} b={model2.successRate} scale={100} unit="pp" /></div>
-              </div>
-              <div className="metric">
-                <div className="k">Utilisation</div>
-                <div className="v mono">{pct(model2.utilisation)}</div>
-                <div className="d"><Delta a={model1.utilisation} b={model2.utilisation} scale={100} unit="pp" /></div>
-              </div>
-              <div className="metric">
-                <div className="k">Sold seat-hours, 2 weeks</div>
-                <div className="v mono">{fortnightSeatHours.m2.toFixed(0)}</div>
-                <div className="d"><Delta a={fortnightSeatHours.m1} b={fortnightSeatHours.m2} digits={0} /></div>
-              </div>
-              <div className="metric">
-                <div className="k">Cancellations / day</div>
-                <div className="v mono">{model2.cancellations.toFixed(0)}</div>
-                <div className="d"><Delta a={model1.cancellations} b={model2.cancellations} higherIsBetter={false} digits={0} /></div>
-              </div>
-              <div className="metric">
-                <div className="k">Turned away on arrival / day</div>
-                <div className="v mono" style={{ color: model2.turnedAway > 0 ? "#B5432B" : "#172422" }}>{model2.turnedAway.toFixed(1)}</div>
-                <div className="d"><Delta a={model1.turnedAway} b={model2.turnedAway} higherIsBetter={false} /> · {pct(model2.turnedAwayRate)} of people who turn up</div>
-              </div>
-              <div className="metric">
-                <div className="k">1h rejections</div>
-                <div className="v mono" style={{ color: model2.rej1Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(model2.rej1Rate)}</div>
-                <div className="d"><Delta a={model1.rej1Rate} b={model2.rej1Rate} higherIsBetter={false} scale={100} unit="pp" /></div>
-              </div>
-              <div className="metric">
-                <div className="k">2h rejections</div>
-                <div className="v mono" style={{ color: model2.rej2Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(model2.rej2Rate)}</div>
-                <div className="d"><Delta a={model1.rej2Rate} b={model2.rej2Rate} higherIsBetter={false} scale={100} unit="pp" /></div>
-              </div>
+              <Stat label="Success rate" value={pct(model2.successRate)}
+                hint="Accepted requests as a share of all booking requests"
+                delta={<Delta a={model1.successRate} b={model2.successRate} scale={100} unit="pp" />} />
+              <Stat label="Utilisation" value={pct(model2.utilisation)}
+                hint="Seats actually sat in, as a share of all seat time in the day"
+                delta={<Delta a={model1.utilisation} b={model2.utilisation} scale={100} unit="pp" />} />
+              <Stat label="Seat-hours 2wk" value={fortnightSeatHours.m2.toFixed(0)}
+                hint="Seat-hours sold across the ten trading days shown below"
+                delta={<Delta a={fortnightSeatHours.m1} b={fortnightSeatHours.m2} digits={0} />} />
+              <Stat label="Cancels / day" value={model2.cancellations.toFixed(0)}
+                hint="Bookings cancelled before the day, per day"
+                delta={<Delta a={model1.cancellations} b={model2.cancellations} higherIsBetter={false} digits={0} />} />
+              <Stat label="Turned away / day" value={model2.turnedAway.toFixed(1)} alert={model2.turnedAway > 0}
+                hint={`People who turn up and find no seat, per day — ${pct(model2.turnedAwayRate)} of people who turn up`}
+                delta={<Delta a={model1.turnedAway} b={model2.turnedAway} higherIsBetter={false} />} />
+              <Stat label="1h rejected" value={pct(model2.rej1Rate)} alert={model2.rej1Rate > 0.02}
+                hint="Share of 1-hour requests that could not be placed"
+                delta={<Delta a={model1.rej1Rate} b={model2.rej1Rate} higherIsBetter={false} scale={100} unit="pp" />} />
+              <Stat label="2h rejected" value={pct(model2.rej2Rate)} alert={model2.rej2Rate > 0.02}
+                hint="Share of 2-hour requests that could not be placed"
+                delta={<Delta a={model1.rej2Rate} b={model2.rej2Rate} higherIsBetter={false} scale={100} unit="pp" />} />
             </div>
             <h2>Seats filled per half hour, by day</h2>
             <DailyHeatmap days={days} occKey="occ2" seats={seats} />
