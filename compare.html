@@ -183,14 +183,15 @@ function simulateBasic(p, seed) {
 // ---------- Model 1: Flow optimised (50/50 stream constraint) ----------
 function runTrialFlowOptimised(p, rand, dayIndex = 0) {
   const { day, date } = bookingDay(dayIndex);
-  // Each stream has its own seats, so occupancy is tracked per stream
-  const occ1h = new Array(INTERVALS).fill(0);
-  const occ2h = new Array(INTERVALS).fill(0);
+  // Streams are start times, not durations: one cohort starts on the hour, the other at :30.
+  // Each cohort has its own seats, so occupancy is tracked per cohort.
+  const occOnHour = new Array(INTERVALS).fill(0);
+  const occOnHalf = new Array(INTERVALS).fill(0);
   const n = p.demand;
   
   // Separate capacity into two streams (handle odd seat counts)
-  const halfHourCap = Math.ceil(p.seats * 0.5); // 50% for half-hour bookings (round up)
-  const hourCap = p.seats - halfHourCap; // Remaining for hour bookings
+  const hourStartCap = Math.ceil(p.seats * 0.5); // 50% for bookings starting on the hour (round up)
+  const halfStartCap = p.seats - hourStartCap; // Remaining for bookings starting at :30
   
   const customers = [];
   for (let k = 0; k < n; k++) {
@@ -215,15 +216,17 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
   
   for (const c of ordered) {
     req[c.dur]++;
-    // Use stream-specific capacity (reserve applies to 1-hour bookings only)
-    const cap = c.dur === 2 ? halfHourCap - p.reserve : hourCap;
-    const occ = c.dur === 2 ? occ1h : occ2h;
+    // A booking draws on the cohort matching its start time, for its whole length
+    // (reserve applies to 1-hour bookings only)
+    const poolOf = (s) => (s % 2 === 0 ? occOnHour : occOnHalf);
+    const capOf = (s) => (s % 2 === 0 ? hourStartCap : halfStartCap) - (c.dur === 2 ? p.reserve : 0);
     const maxStart = INTERVALS - c.dur;
     
     if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
     const pref = sampleIdx(weightsCache[c.dur], rand);
     
     const feasible = (s) => {
+      const occ = poolOf(s), cap = capOf(s);
       for (let i = s; i < s + c.dur; i++) if (occ[i] + 1 > cap) return false;
       return true;
     };
@@ -243,6 +246,7 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
     if (p.smart) {
       let best = -Infinity;
       for (const s of candidates) {
+        const occ = poolOf(s);
         let load = 0;
         for (let i = s; i < s + c.dur; i++) load += occ[i];
         const score = load * 100 - Math.abs(s - pref);
@@ -252,11 +256,12 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
       pick = candidates.reduce((a, s) => Math.abs(s - pref) < Math.abs(a - pref) ? s : a, candidates[0]);
     }
     
-    for (let i = pick; i < pick + c.dur; i++) occ[i]++;
+    const picked = poolOf(pick);
+    for (let i = pick; i < pick + c.dur; i++) picked[i]++;
     results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, startTime: timeLabel(pick), model: 'Flow Optimised' });
   }
   
-  const occ = occ1h.map((v, i) => v + occ2h[i]);
+  const occ = occOnHour.map((v, i) => v + occOnHalf[i]);
   const used = occ.reduce((a, c) => a + c, 0);
   return { occ, used, req, rej, results };
 }
@@ -268,10 +273,10 @@ function simulateFlowOptimised(p, seed) {
   let allResults = [];
   
   // Calculate actual available capacity for fair utilisation comparison
-  const halfHourCap = Math.ceil(p.seats * 0.5);
-  const hourCap = p.seats - halfHourCap;
+  const hourStartCap = Math.ceil(p.seats * 0.5);
+  const halfStartCap = p.seats - hourStartCap;
   // Account for reserve in capacity calculation
-  const totalCapacity = (halfHourCap - p.reserve + hourCap) * INTERVALS;
+  const totalCapacity = (hourStartCap + halfStartCap - p.reserve) * INTERVALS;
   
   for (let t = 0; t < TRIALS; t++) {
     const r = runTrialFlowOptimised(p, rand, t);
@@ -707,8 +712,10 @@ function App() {
   ]);
 
   // where Model 2's lead peaks, and where it has all but closed again
-  const peakPoint = seatsSweep.reduce((a, p) => (p.s2 - p.s1 > a.s2 - a.s1 ? p : a), seatsSweep[0]);
-  const closed = seatsSweep.find((p) => p.seats > peakPoint.seats && p.s2 - p.s1 < 0.01);
+  const peakPoint = seatsSweep.reduce((a, p) => (Math.abs(p.s2 - p.s1) > Math.abs(a.s2 - a.s1) ? p : a), seatsSweep[0]);
+  const peakLeadsModel2 = peakPoint.s2 >= peakPoint.s1;
+  const currentLead = Math.round((model2.successRate - model1.successRate) * 100);
+  const closed = seatsSweep.find((p) => p.seats > peakPoint.seats && Math.abs(p.s2 - p.s1) < 0.01);
   const catchUpSeats = closed ? closed.seats : seatsSweep[seatsSweep.length - 1].seats;
 
   // Preview a few rows per model per day so the table spans the whole fortnight
@@ -876,7 +883,7 @@ function App() {
 
         <div>
           <div className="colhead"><span className="badge flow">Model 1: Flow optimised</span></div>
-          <p className="colnote">Separate fixed cohorts for hour and half-hour bookings. Each stream has a maximum intake of 50% of available capacity. Combined theoretical ceiling of 100%.</p>
+          <p className="colnote">Separate fixed cohorts by start time: bookings starting on the hour and bookings starting at :30. Each stream has a maximum intake of 50% of available capacity. Combined theoretical ceiling of 100%.</p>
           <div className="panel">
             <div className="metrics">
               <div className="metric">
@@ -954,7 +961,7 @@ function App() {
 
       <div style={{ maxWidth: 1320, margin: "18px auto 0" }}>
         <div className="panel">
-          <h2>Does Model 2 stay ahead as you add seats?</h2>
+          <h2>Which model serves more people as you add seats?</h2>
           <div className="chart-grid">
             <div>
               <div className="legend">
@@ -964,33 +971,41 @@ function App() {
               <SeatsChart points={seatsSweep} seats={seats} />
               <p className="note" style={{ marginTop: 0 }}>
                 Each line shows how many out of every 100 people asking for a test get one, at that number of seats.
-                The shaded band between the lines is Model 2's lead.
+                The shaded band between the lines is the gap between the two models.
               </p>
             </div>
             <div className="story">
               <p>
-                Model 1 keeps two separate piles of seats: one pile only for 1-hour tests, the other only for
-                2-hour tests. Model 2 keeps every seat in one pile and gives a free seat to whoever asks next.
+                Model 1 keeps two separate piles of seats: one pile only for tests that start on the hour, the
+                other only for tests that start at half past. Model 2 keeps every seat in one pile and gives a
+                free seat to whoever asks next.
               </p>
               <p>
                 <b>With very few seats</b> both models are full all day, so they turn away almost the same people.
                 Sharing seats does not help when there is nothing spare to share.
               </p>
               <p>
-                <b>In the middle</b> Model 2 pulls ahead. Only {twoHourShare}% of people want a 2-hour test, but
-                Model 1 still locks half its seats away for them, so those seats sit empty while 1-hour customers
-                are turned away. The lead is biggest at about <b>{peakPoint.seats} seats</b>, where Model 2 says yes
-                to {Math.round(peakPoint.s2 * 100)} people out of 100 and Model 1 only {Math.round(peakPoint.s1 * 100)}.
+                <b>In the middle</b> the two models pull apart, and which one wins depends on your settings.
+                Model 2 wins when lots of people want the same length of test at the same time, because it can
+                lend any spare seat to anyone. Model 1 wins when tidy start times matter more, because everyone
+                in a pile starts together and fewer awkward half-hour gaps are left that nothing fits into.
+                The gap is biggest at about <b>{peakPoint.seats} seats</b>, where{" "}
+                <b>{peakLeadsModel2 ? "Model 2" : "Model 1"}</b> says yes to{" "}
+                {Math.round(Math.max(peakPoint.s1, peakPoint.s2) * 100)} people out of 100 and the other model only{" "}
+                {Math.round(Math.min(peakPoint.s1, peakPoint.s2) * 100)}.
               </p>
               <p>
-                <b>With plenty of seats</b> Model 1 catches up: from about <b>{catchUpSeats} seats</b> even the
-                smaller pile is big enough for everyone who asks, so both models say yes to nearly everybody and
-                the lead shrinks back to nothing.
+                <b>With plenty of seats</b> the difference fades: from about <b>{catchUpSeats} seats</b> there are
+                enough seats in every pile for everyone who asks, so both models say yes to nearly everybody.
               </p>
               <p>
-                So splitting seats into fixed piles only costs you while one pile is the bottleneck. At your
-                current {seats} seats the lead is worth about{" "}
-                <b>{Math.round((model2.successRate - model1.successRate) * 100)} extra people served in every 100 who ask</b>.
+                So the split into fixed piles only matters while one pile is the bottleneck. At your current{" "}
+                {seats} seats, {currentLead === 0 ? "the two models serve about the same number of people" : (
+                  <>
+                    <b>{currentLead > 0 ? "Model 2" : "Model 1"}</b> serves about <b>{Math.abs(currentLead)} more
+                    people in every 100 who ask</b>
+                  </>
+                )}.
               </p>
             </div>
           </div>
