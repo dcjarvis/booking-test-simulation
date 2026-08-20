@@ -233,7 +233,16 @@
         <label className="ctl">
           <span className="ctl-row">
             <span>{label}</span>
-            <span className="mono val">{value}{unit}</span>
+            <input 
+              type="number" 
+              min={min} 
+              max={max} 
+              step={step} 
+              value={value}
+              onChange={(e) => onChange(Number(e.target.value))}
+              className="mono val-input"
+            />
+            <span className="mono val-unit">{unit}</span>
           </span>
           <input type="range" min={min} max={max} step={step} value={value}
             onChange={(e) => onChange(Number(e.target.value))} />
@@ -296,8 +305,24 @@
             .panel { background: #fff; border: 1px solid #D8DFDD; border-radius: 10px; padding: 18px; }
             .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #6C7A77; margin-bottom: 12px; font-weight: 600; }
             .ctl { display: block; margin-bottom: 14px; }
-            .ctl-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+            .ctl-row { display: flex; justify-content: space-between; margin-bottom: 4px; align-items: center; }
             .val { color: #0E5B4A; font-weight: 600; }
+            .val-input { 
+              width: 60px; 
+              padding: 4px 8px; 
+              border: 1px solid #D8DFDD; 
+              border-radius: 4px; 
+              color: #0E5B4A; 
+              font-weight: 600; 
+              font-size: 14px;
+              text-align: right;
+            }
+            .val-input:focus { 
+              outline: 2px solid #0E5B4A; 
+              outline-offset: 1px;
+              border-color: #0E5B4A;
+            }
+            .val-unit { color: #0E5B4A; font-weight: 600; margin-left: 4px; }
             input[type=range] { width: 100%; accent-color: #0E5B4A; }
             .toggles { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; margin-bottom: 14px; }
             .toggle { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid #D8DFDD;
