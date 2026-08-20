@@ -339,7 +339,9 @@ function runTrialFlowOptimised(p, demand, dayIndex = 0) {
       continue; }
     
     let pick;
-    if (p.smart) {
+    // people who named a time always take the nearest slot they can get; smart packing only moves
+    // customers who said they don't mind when they come
+    if (p.smart && c.flexible) {
       let best = -Infinity;
       for (const s of candidates) {
         const occ = poolOf(s);
@@ -443,7 +445,9 @@ function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
       continue; }
     
     let pick;
-    if (p.smart) {
+    // people who named a time always take the nearest slot they can get; smart packing only moves
+    // customers who said they don't mind when they come
+    if (p.smart && c.flexible) {
       let best = -Infinity;
       for (const s of candidates) {
         let load = 0;
