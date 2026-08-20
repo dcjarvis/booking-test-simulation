@@ -30,7 +30,7 @@
 
     // ---------- model ----------
     const INTERVALS = 16; // 09:00–17:00 in 30-min steps
-    const TRIALS = 200;
+    const TRIALS = 1000;
 
     const timeLabel = (i) => {
       const h = 9 + Math.floor(i / 2);
@@ -263,7 +263,7 @@
     function App() {
       const [seats, setSeats] = useState(30);
       const [demand, setDemand] = useState(280);
-      const [twoHourShare, setTwoHourShare] = useState(35);
+      const [twoHourShare, setTwoHourShare] = useState(5);
       const [peakBias, setPeakBias] = useState(50);
       const [lastMinuteShare, setLastMinuteShare] = useState(40);
       const [cancelRate, setCancelRate] = useState(8);
