@@ -158,9 +158,9 @@ function runTrialFlowOptimised(p, rand) {
   const occ = new Array(INTERVALS).fill(0);
   const n = p.demand;
   
-  // Separate capacity into two streams
-  const halfHourCap = Math.floor(p.seats * 0.5); // 50% for half-hour bookings
-  const hourCap = Math.floor(p.seats * 0.5); // 50% for hour bookings
+  // Separate capacity into two streams (handle odd seat counts)
+  const halfHourCap = Math.ceil(p.seats * 0.5); // 50% for half-hour bookings (round up)
+  const hourCap = p.seats - halfHourCap; // Remaining for hour bookings
   
   const customers = [];
   for (let k = 0; k < n; k++) {
@@ -181,10 +181,12 @@ function runTrialFlowOptimised(p, rand) {
   const req = { 2: 0, 4: 0 };
   const rej = { 2: 0, 4: 0 };
   
+  const results = [];
+  
   for (const c of ordered) {
     req[c.dur]++;
-    // Use stream-specific capacity
-    const cap = c.dur === 2 ? halfHourCap : hourCap;
+    // Use stream-specific capacity (reserve applies to 1-hour bookings only)
+    const cap = c.dur === 2 ? halfHourCap - p.reserve : hourCap;
     const maxStart = INTERVALS - c.dur;
     
     if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
@@ -202,7 +204,9 @@ function runTrialFlowOptimised(p, rand) {
       candidates = startsCache[c.dur].filter((s) => Math.abs(s - pref) <= 1 && feasible(s));
     }
     
-    if (candidates.length === 0) { rej[c.dur]++; continue; }
+    if (candidates.length === 0) { rej[c.dur]++; 
+      results.push({ duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, startTime: null, model: 'Flow Optimised' });
+      continue; }
     
     let pick;
     if (p.smart) {
@@ -218,29 +222,40 @@ function runTrialFlowOptimised(p, rand) {
     }
     
     for (let i = pick; i < pick + c.dur; i++) occ[i]++;
+    results.push({ duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, startTime: timeLabel(pick), model: 'Flow Optimised' });
   }
   
   const used = occ.reduce((a, c) => a + c, 0);
-  return { occ, used, req, rej };
+  return { occ, used, req, rej, results };
 }
 
 function simulateFlowOptimised(p, seed) {
   const rand = mulberry32(seed);
   const occSum = new Array(INTERVALS).fill(0);
   let used = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
+  let allResults = [];
+  
+  // Calculate actual available capacity for fair utilisation comparison
+  const halfHourCap = Math.ceil(p.seats * 0.5);
+  const hourCap = p.seats - halfHourCap;
+  // Account for reserve in capacity calculation
+  const totalCapacity = (halfHourCap - p.reserve + hourCap) * INTERVALS;
+  
   for (let t = 0; t < TRIALS; t++) {
     const r = runTrialFlowOptimised(p, rand);
     r.occ.forEach((v, i) => (occSum[i] += v));
     used += r.used;
     req1 += r.req[2]; req2 += r.req[4];
     rej1 += r.rej[2]; rej2 += r.rej[4];
+    allResults = allResults.concat(r.results);
   }
   return {
     avgOcc: occSum.map((v) => v / TRIALS),
-    utilisation: used / TRIALS / (p.seats * INTERVALS),
+    utilisation: used / TRIALS / totalCapacity,
     soldSeatHours: used / TRIALS / 2,
     rej1Rate: req1 ? rej1 / req1 : 0,
     rej2Rate: req2 ? rej2 / req2 : 0,
+    results: allResults,
   };
 }
 
@@ -269,9 +284,11 @@ function runTrialUtilisationOptimised(p, rand) {
   const req = { 2: 0, 4: 0 };
   const rej = { 2: 0, 4: 0 };
   
+  const results = [];
+  
   for (const c of ordered) {
     req[c.dur]++;
-    // Use full capacity for both durations
+    // Use full capacity for both durations (reserve applies to 1-hour bookings only, consistent with basic model)
     const cap = c.dur === 2 ? p.seats - p.reserve : p.seats;
     const maxStart = INTERVALS - c.dur;
     
@@ -290,7 +307,9 @@ function runTrialUtilisationOptimised(p, rand) {
       candidates = startsCache[c.dur].filter((s) => Math.abs(s - pref) <= 1 && feasible(s));
     }
     
-    if (candidates.length === 0) { rej[c.dur]++; continue; }
+    if (candidates.length === 0) { rej[c.dur]++; 
+      results.push({ duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, startTime: null, model: 'Utilisation Optimised' });
+      continue; }
     
     let pick;
     if (p.smart) {
@@ -306,22 +325,25 @@ function runTrialUtilisationOptimised(p, rand) {
     }
     
     for (let i = pick; i < pick + c.dur; i++) occ[i]++;
+    results.push({ duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, startTime: timeLabel(pick), model: 'Utilisation Optimised' });
   }
   
   const used = occ.reduce((a, c) => a + c, 0);
-  return { occ, used, req, rej };
+  return { occ, used, req, rej, results };
 }
 
 function simulateUtilisationOptimised(p, seed) {
   const rand = mulberry32(seed);
   const occSum = new Array(INTERVALS).fill(0);
   let used = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
+  let allResults = [];
   for (let t = 0; t < TRIALS; t++) {
     const r = runTrialUtilisationOptimised(p, rand);
     r.occ.forEach((v, i) => (occSum[i] += v));
     used += r.used;
     req1 += r.req[2]; req2 += r.req[4];
     rej1 += r.rej[2]; rej2 += r.rej[4];
+    allResults = allResults.concat(r.results);
   }
   return {
     avgOcc: occSum.map((v) => v / TRIALS),
@@ -329,6 +351,7 @@ function simulateUtilisationOptimised(p, seed) {
     soldSeatHours: used / TRIALS / 2,
     rej1Rate: req1 ? rej1 / req1 : 0,
     rej2Rate: req2 ? rej2 / req2 : 0,
+    results: allResults,
   };
 }
 
@@ -549,6 +572,41 @@ function App() {
   const pct = (v) => (v * 100).toFixed(1) + "%";
   const pctPts = (v) => (v * 100).toFixed(1) + "pp";
 
+  // Combine results from both models (single trial for display)
+  const allResults = useMemo(() => {
+    const rand = mulberry32(seed);
+    const trial1 = runTrialFlowOptimised(shared, rand);
+    const trial2 = runTrialUtilisationOptimised(shared, rand);
+    return [...(trial1.results || []), ...(trial2.results || [])];
+  }, [shared, seed]);
+
+  // Convert results to CSV
+  const downloadCSV = () => {
+    const headers = ['Model', 'Duration', 'Flexible', 'Accepted', 'Start Time'];
+    const rows = allResults.map(r => [
+      r.model,
+      r.duration,
+      r.flexible ? 'Yes' : 'No',
+      r.accepted ? 'Yes' : 'No',
+      r.startTime || 'N/A'
+    ]);
+    
+    const csvContent = [
+      headers.join(','),
+      ...rows.map(row => row.join(','))
+    ].join('\n');
+    
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    link.setAttribute('href', url);
+    link.setAttribute('download', `booking-simulation-${seed}.csv`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   return (
     <div className="wrap">
       <style>{`
@@ -618,6 +676,19 @@ function App() {
         .axis span { text-align: center; }
         .note { color: #6C7A77; font-size: 12px; margin-top: 14px; line-height: 1.5; }
         .divider { height: 1px; background: #D8DFDD; margin: 16px 0; }
+        .download-btn { 
+          padding: 8px 16px; 
+          border-radius: 6px; 
+          border: 1px solid #0E5B4A; 
+          background: #0E5B4A; 
+          color: #fff; 
+          font: inherit; 
+          cursor: pointer; 
+          font-size: 13px;
+          font-weight: 500;
+        }
+        .download-btn:hover { background: #0a4a3c; }
+        .download-btn:focus-visible { outline: 2px solid #0E5B4A; outline-offset: 1px; }
       `}</style>
 
       <header>
@@ -717,6 +788,44 @@ function App() {
           share one random seed and the same demand/policy inputs, any difference you see comes purely
           from the different capacity allocation strategies — the 50/50 stream constraint vs flexible utilisation.
         </p>
+      </div>
+
+      <div style={{ maxWidth: 1320, margin: "18px auto 0" }}>
+        <div className="panel">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <h2>Sample data ({allResults.length.toLocaleString()} bookings)</h2>
+            <button className="download-btn" onClick={downloadCSV}>Download CSV</button>
+          </div>
+          <div style={{ maxHeight: 300, overflow: "auto", border: "1px solid #D8DFDD", borderRadius: 8 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+              <thead style={{ position: "sticky", top: 0, background: "#F7F9F8" }}>
+                <tr>
+                  <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Model</th>
+                  <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Duration</th>
+                  <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Flexible</th>
+                  <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Accepted</th>
+                  <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Start Time</th>
+                </tr>
+              </thead>
+              <tbody>
+                {allResults.slice(0, 100).map((r, i) => (
+                  <tr key={i} style={{ borderBottom: "1px solid #E3E9E7" }}>
+                    <td style={{ padding: "8px 12px", color: r.model === 'Flow Optimised' ? "#45524F" : "#0E5B4A" }}>{r.model}</td>
+                    <td style={{ padding: "8px 12px" }}>{r.duration}</td>
+                    <td style={{ padding: "8px 12px" }}>{r.flexible ? 'Yes' : 'No'}</td>
+                    <td style={{ padding: "8px 12px", color: r.accepted ? "#0E5B4A" : "#B5432B" }}>{r.accepted ? 'Yes' : 'No'}</td>
+                    <td style={{ padding: "8px 12px", fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" }}>{r.startTime || 'N/A'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {allResults.length > 100 && (
+              <p style={{ padding: "12px", color: "#6C7A77", fontSize: 12, textAlign: "center", margin: 0 }}>
+                Showing first 100 of {allResults.length.toLocaleString()} bookings. Download CSV for full dataset.
+              </p>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
