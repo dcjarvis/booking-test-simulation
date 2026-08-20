@@ -965,8 +965,17 @@ function App() {
             <Toggle label="2h slots start on the hour" on={hourAlign} onChange={setHourAlign}
               hint="Restricts 2-hour bookings to 9:00, 10:00, 11:00…" />
             <Toggle label="Smart placement" on={smart} onChange={setSmart}
-              hint="Flexible customers are steered into already-busy intervals to limit fragmentation" />
+              hint="Customers who don't mind when they come are put into the busiest half hour that still has a free seat, so empty seats stay together in one lump" />
           </div>
+          <p className="note" style={{ marginTop: 8 }}>
+            <b>Smart placement</b> is like filling a bus. Some customers don't mind what time they come.
+            When it is <b>on</b>, we sit those customers next to people who are already in, filling up
+            the busiest half hours first. That keeps all the leftover seats together in one big lump,
+            and a big lump is the only thing a long 2-hour test can fit into. When it is <b>off</b>,
+            we just give everyone the time closest to the one they asked for, which sprinkles the empty
+            seats all over the day in little gaps that nothing fits into, so we end up saying no to
+            more people even though the seats are there.
+          </p>
           <Slider label="Seats reserved for 2h bookings" value={reserve} onChange={setReserve} min={0} max={10} />
 
           <h2 style={{ marginTop: 18 }}>Advanced: overbooking &amp; cancellations</h2>
