@@ -1,0 +1,469 @@
+import { useMemo, useState } from "react";
+
+// ---------- model ----------
+const INTERVALS = 16; // 09:00–17:00 in 30-min steps
+const TRIALS = 200;
+
+const timeLabel = (i) => {
+  const h = 9 + Math.floor(i / 2);
+  return `${h}:${i % 2 ? "30" : "00"}`;
+};
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function shuffle(arr, rand) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+}
+
+function prefWeights(maxStart, peakBias) {
+  const b = peakBias / 100;
+  const w = [];
+  for (let i = 0; i <= maxStart; i++) {
+    const peaks = Math.exp(-((i - 3) ** 2) / 6) + 0.8 * Math.exp(-((i - 10) ** 2) / 6);
+    w.push((1 - b) * 1 + b * 2.2 * peaks);
+  }
+  return w;
+}
+
+function sampleIdx(weights, rand) {
+  const total = weights.reduce((a, c) => a + c, 0);
+  let r = rand() * total;
+  for (let i = 0; i < weights.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return i;
+  }
+  return weights.length - 1;
+}
+
+// All randomness lives here. Both policy setups then run over the exact same
+// customers, preferences and cancellation fates, so any difference in results
+// is purely the policy.
+function makePopulation(d, rand) {
+  const n = d.demand;
+  const weights = {
+    2: prefWeights(INTERVALS - 2, d.peakBias),
+    4: prefWeights(INTERVALS - 4, d.peakBias),
+  };
+  const customers = [];
+  for (let k = 0; k < n; k++) {
+    const dur = rand() < d.twoHourShare / 100 ? 4 : 2;
+    customers.push({
+      dur,
+      flexible: rand() < d.lastMinuteShare / 100,
+      pref: sampleIdx(weights[dur], rand),
+      incU: rand(),        // compared against each setup's incentive uptake
+      willCancel: rand() < d.cancelRate / 100,
+      lateCancel: rand() < d.lateCancelShare / 100,
+      atU: rand(),         // cancellation timing within remaining arrivals
+    });
+  }
+  const planners = customers.filter((c) => !c.flexible);
+  const flex = customers.filter((c) => c.flexible);
+  shuffle(planners, rand);
+  shuffle(flex, rand);
+  return { ordered: [...planners, ...flex], earlyCount: planners.length, n };
+}
+
+// Deterministic given a population and a policy.
+function runPolicy(pop, d, pol) {
+  const occ = new Array(INTERVALS).fill(0);
+  const startsCount = new Array(INTERVALS).fill(0);
+  const quota = Math.floor(d.seats / 2);
+  const capBase = d.seats + pol.overbook;
+  const { ordered, earlyCount, n } = pop;
+
+  const cancelMap = new Map();
+  const insideCutoff = [];
+  const applyCancels = (k) => {
+    const list = cancelMap.get(k);
+    if (!list) return;
+    for (const [s, dur] of list) {
+      for (let i = s; i < s + dur; i++) occ[i]--;
+      startsCount[s]--;
+    }
+    cancelMap.delete(k);
+  };
+
+  const validStarts = (dur) => {
+    const out = [];
+    for (let s = 0; s <= INTERVALS - dur; s++) {
+      if (dur === 4 && pol.hourAlign && s % 2 !== 0) continue;
+      out.push(s);
+    }
+    return out;
+  };
+  const startsCache = { 2: validStarts(2), 4: validStarts(4) };
+
+  const req = { 2: 0, 4: 0 };
+  const rej = { 2: 0, 4: 0 };
+  let soldIntervals = 0;
+
+  for (let k = 0; k < n; k++) {
+    applyCancels(k);
+    const c = ordered[k];
+    const late = k >= earlyCount;
+    req[c.dur]++;
+
+    const reserveNow = c.dur === 2 && !(pol.releaseReserve && late) ? pol.reserve : 0;
+    const cap = capBase - reserveNow;
+
+    const feasible = (s) => {
+      if (pol.cohort && startsCount[s] >= quota) return false;
+      for (let i = s; i < s + c.dur; i++) if (occ[i] + 1 > cap) return false;
+      return true;
+    };
+
+    let candidates;
+    if (c.flexible) {
+      candidates = startsCache[c.dur].filter(feasible);
+    } else {
+      const window = c.incU < pol.incentive / 100 ? 4 : 1;
+      candidates = startsCache[c.dur].filter((s) => Math.abs(s - c.pref) <= window && feasible(s));
+    }
+
+    if (candidates.length === 0) {
+      rej[c.dur]++;
+      continue;
+    }
+
+    let pick;
+    if (pol.smart) {
+      let best = -Infinity;
+      for (const s of candidates) {
+        let load = 0;
+        for (let i = s; i < s + c.dur; i++) load += occ[i];
+        const score = load * 100 - Math.abs(s - c.pref);
+        if (score > best) { best = score; pick = s; }
+      }
+    } else {
+      pick = candidates.reduce((a, s) =>
+        Math.abs(s - c.pref) < Math.abs(a - c.pref) ? s : a, candidates[0]);
+    }
+
+    for (let i = pick; i < pick + c.dur; i++) occ[i]++;
+    startsCount[pick]++;
+    soldIntervals += c.dur;
+
+    if (c.willCancel) {
+      const at = k + 1 + Math.floor(c.atU * (n - k));
+      if (c.lateCancel || at >= n) insideCutoff.push([pick, c.dur]);
+      else {
+        if (!cancelMap.has(at)) cancelMap.set(at, []);
+        cancelMap.get(at).push([pick, c.dur]);
+      }
+    }
+  }
+
+  for (const at of [...cancelMap.keys()]) applyCancels(at);
+  let deadIntervals = 0;
+  for (const [s, dur] of insideCutoff) {
+    for (let i = s; i < s + dur; i++) occ[i]--;
+    deadIntervals += dur;
+  }
+
+  let attended = 0, bumped = 0;
+  for (const v of occ) {
+    attended += Math.min(v, d.seats);
+    bumped += Math.max(0, v - d.seats);
+  }
+  return { occ, attended, bumped, sold: soldIntervals, dead: deadIntervals, req, rej };
+}
+
+function simulate(d, polA, polB, seed) {
+  const rand = mulberry32(seed);
+  const agg = () => ({
+    occSum: new Array(INTERVALS).fill(0),
+    attended: 0, bumped: 0, sold: 0, dead: 0, req1: 0, req2: 0, rej1: 0, rej2: 0,
+  });
+  const A = agg(), B = agg();
+  const add = (acc, r) => {
+    r.occ.forEach((v, i) => (acc.occSum[i] += v));
+    acc.attended += r.attended; acc.bumped += r.bumped; acc.sold += r.sold; acc.dead += r.dead;
+    acc.req1 += r.req[2]; acc.req2 += r.req[4];
+    acc.rej1 += r.rej[2]; acc.rej2 += r.rej[4];
+  };
+  for (let t = 0; t < TRIALS; t++) {
+    const pop = makePopulation(d, rand);
+    add(A, runPolicy(pop, d, polA));
+    add(B, runPolicy(pop, d, polB));
+  }
+  const finish = (acc) => ({
+    avgOcc: acc.occSum.map((v) => v / TRIALS),
+    utilisation: acc.attended / TRIALS / (d.seats * INTERVALS),
+    filledSeatHours: acc.attended / TRIALS / 2,
+    paidSeatHours: (acc.sold - acc.bumped) / TRIALS / 2,
+    deadSeatHours: acc.dead / TRIALS / 2,
+    bumpedSeatHours: acc.bumped / TRIALS / 2,
+    rej1Rate: acc.req1 ? acc.rej1 / acc.req1 : 0,
+    rej2Rate: acc.req2 ? acc.rej2 / acc.req2 : 0,
+  });
+  return { A: finish(A), B: finish(B) };
+}
+
+// ---------- ui ----------
+const cellColour = (frac, dark) => {
+  const from = [228, 236, 233];
+  const to = dark ? [43, 74, 115] : [14, 91, 74];
+  const f = Math.min(1, Math.max(0, frac));
+  const c = from.map((v, i) => Math.round(v + (to[i] - v) * f));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+};
+
+function Slider({ label, value, onChange, min, max, step = 1, unit = "" }) {
+  return (
+    <label className="ctl">
+      <span className="ctl-row">
+        <span>{label}</span>
+        <span className="mono val">{value}{unit}</span>
+      </span>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={(e) => onChange(Number(e.target.value))} />
+    </label>
+  );
+}
+
+function Toggle({ label, on, onChange, hint }) {
+  return (
+    <button className={`toggle ${on ? "on" : ""}`} onClick={() => onChange(!on)}
+      aria-pressed={on} title={hint}>
+      <span className="pip" />
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function PolicyPanel({ pol, setPol, label, accent }) {
+  const set = (key) => (v) => setPol({ ...pol, [key]: v });
+  return (
+    <div className="panel pol" style={{ borderTopColor: accent }}>
+      <h2 style={{ color: accent }}>{label}</h2>
+      <div className="toggles">
+        <Toggle label="Fixed cohort quotas" on={pol.cohort} onChange={set("cohort")}
+          hint="At most half of capacity may start in any half-hour slot; seat cap still enforced" />
+        <Toggle label="2h slots start on the hour" on={pol.hourAlign} onChange={set("hourAlign")} />
+        <Toggle label="Smart placement" on={pol.smart} onChange={set("smart")}
+          hint="Flexible customers steered into busy intervals to limit fragmentation" />
+        <Toggle label="Release reserve to late bookers" on={pol.releaseReserve} onChange={set("releaseReserve")} />
+      </div>
+      <Slider label="Seats reserved for 2h" value={pol.reserve} onChange={set("reserve")} min={0} max={10} />
+      <Slider label="Overbooking per interval" value={pol.overbook} onChange={set("overbook")} min={0} max={6} />
+      <Slider label="Flexibility incentive uptake" value={pol.incentive} onChange={set("incentive")} min={0} max={100} unit="%" />
+    </div>
+  );
+}
+
+function Results({ r, seats, accent, dark }) {
+  const pct = (v) => (v * 100).toFixed(1) + "%";
+  return (
+    <>
+      <div className="metrics">
+        <div className="metric">
+          <div className="k">Utilisation</div>
+          <div className="v mono" style={{ color: accent }}>{pct(r.utilisation)}</div>
+          <div className="n">{r.filledSeatHours.toFixed(0)} of {seats * 8} seat-hours</div>
+        </div>
+        <div className="metric">
+          <div className="k">Paid</div>
+          <div className="v mono">{r.paidSeatHours.toFixed(0)}</div>
+          <div className="n">seat-hours, no refunds</div>
+        </div>
+        <div className="metric">
+          <div className="k">Dead</div>
+          <div className="v mono" style={{ color: r.deadSeatHours > 1 ? "#B5432B" : "#172422" }}>
+            {r.deadSeatHours.toFixed(1)}
+          </div>
+          <div className="n">paid, empty, unsellable</div>
+        </div>
+        <div className="metric">
+          <div className="k">Bumped</div>
+          <div className="v mono" style={{ color: r.bumpedSeatHours > 0.1 ? "#B5432B" : "#172422" }}>
+            {r.bumpedSeatHours.toFixed(1)}
+          </div>
+          <div className="n">over capacity on the day</div>
+        </div>
+      </div>
+      <div className="panel">
+        <h2>Seats occupied per half hour</h2>
+        <div className="ledger">
+          {r.avgOcc.map((v, i) => {
+            const f = v / seats;
+            return (
+              <div key={i} className="cell mono"
+                style={{ background: cellColour(f, dark), color: f > 0.55 ? "#fff" : "#172422" }}>
+                {Math.round(v)}
+              </div>
+            );
+          })}
+        </div>
+        <div className="axis mono">
+          {Array.from({ length: INTERVALS }, (_, i) => (
+            <span key={i}>{i % 4 === 0 ? timeLabel(i).replace(":00", "") : ""}</span>
+          ))}
+        </div>
+        <div className="bars">
+          <div className="bar-row">
+            <span>1h rejected</span>
+            <div className="bar-track"><div className="bar-fill" style={{ width: `${Math.min(100, r.rej1Rate * 100)}%` }} /></div>
+            <span className="mono">{pct(r.rej1Rate)}</span>
+          </div>
+          <div className="bar-row">
+            <span>2h rejected</span>
+            <div className="bar-track"><div className="bar-fill" style={{ width: `${Math.min(100, r.rej2Rate * 100)}%` }} /></div>
+            <span className="mono">{pct(r.rej2Rate)}</span>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+const GREEN = "#0E5B4A", BLUE = "#2B4A73";
+
+export default function App() {
+  const [seats, setSeats] = useState(30);
+  const [demand, setDemand] = useState(280);
+  const [twoHourShare, setTwoHourShare] = useState(35);
+  const [peakBias, setPeakBias] = useState(50);
+  const [lastMinuteShare, setLastMinuteShare] = useState(40);
+  const [cancelRate, setCancelRate] = useState(8);
+  const [lateCancelShare, setLateCancelShare] = useState(60);
+  const [seed, setSeed] = useState(1);
+
+  const [polA, setPolA] = useState({
+    cohort: false, hourAlign: true, smart: true,
+    reserve: 0, releaseReserve: true, overbook: 0, incentive: 0,
+  });
+  const [polB, setPolB] = useState({
+    cohort: true, hourAlign: true, smart: false,
+    reserve: 0, releaseReserve: true, overbook: 0, incentive: 0,
+  });
+
+  const d = { seats, demand, twoHourShare, peakBias, lastMinuteShare, cancelRate, lateCancelShare };
+  const r = useMemo(() => simulate(d, polA, polB, seed), [
+    seats, demand, twoHourShare, peakBias, lastMinuteShare, cancelRate, lateCancelShare,
+    polA, polB, seed,
+  ]);
+
+  const gap = (r.A.utilisation - r.B.utilisation) * 100;
+  const leader = gap === 0 ? null : gap > 0 ? "A" : "B";
+
+  return (
+    <div className="wrap">
+      <style>{`
+        * { box-sizing: border-box; margin: 0; }
+        .wrap {
+          min-height: 100vh; background: #EEF1F0; color: #172422;
+          font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          padding: 28px 20px 48px; font-size: 14px;
+        }
+        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+        header { max-width: 1200px; margin: 0 auto 20px; }
+        h1 { font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
+        .sub { color: #6C7A77; margin-top: 4px; max-width: 66ch; }
+        .grid { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: 264px 1fr; gap: 18px; }
+        @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+        .panel { background: #fff; border: 1px solid #D8DFDD; border-radius: 10px; padding: 16px; }
+        .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #6C7A77; margin-bottom: 12px; font-weight: 600; }
+        .pol { border-top: 3px solid; margin-bottom: 14px; }
+        .ctl { display: block; margin-bottom: 12px; }
+        .ctl-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+        .val { color: #0E5B4A; font-weight: 600; }
+        input[type=range] { width: 100%; accent-color: #0E5B4A; }
+        .toggles { display: flex; flex-direction: column; gap: 7px; margin-bottom: 12px; }
+        .toggle { display: flex; align-items: center; gap: 9px; padding: 7px 10px; border: 1px solid #D8DFDD;
+          border-radius: 8px; background: #fff; cursor: pointer; font: inherit; color: inherit; text-align: left; font-size: 13px; }
+        .toggle:focus-visible { outline: 2px solid #0E5B4A; outline-offset: 1px; }
+        .toggle .pip { width: 10px; height: 10px; border-radius: 50%; background: #D8DFDD; flex: none; }
+        .toggle.on { border-color: #0E5B4A; background: #F2F7F5; }
+        .toggle.on .pip { background: #0E5B4A; }
+        .reroll { margin-top: 6px; width: 100%; padding: 9px; border-radius: 8px; border: 1px solid #172422;
+          background: #172422; color: #fff; font: inherit; cursor: pointer; }
+        .banner { max-width: 1200px; margin: 0 auto 14px; background: #172422; color: #fff; border-radius: 10px;
+          padding: 12px 18px; display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+        .banner .mono { font-size: 16px; }
+        .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+        @media (max-width: 1060px) { .duo { grid-template-columns: 1fr; } }
+        .metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 12px; }
+        .metric { background: #fff; border: 1px solid #D8DFDD; border-radius: 10px; padding: 11px 13px; }
+        .metric .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #6C7A77; font-weight: 600; }
+        .metric .v { font-size: 23px; font-weight: 650; margin-top: 3px; letter-spacing: -0.02em; }
+        .metric .n { color: #6C7A77; font-size: 11px; margin-top: 2px; }
+        .ledger { display: grid; grid-template-columns: repeat(16, 1fr); gap: 2px; margin: 8px 0 4px; }
+        .cell { border-radius: 3px; aspect-ratio: 1 / 1.6; display: flex; align-items: flex-end;
+          justify-content: center; padding-bottom: 4px; font-size: 10px; font-weight: 600; }
+        .axis { display: grid; grid-template-columns: repeat(16, 1fr); gap: 2px; color: #6C7A77; font-size: 9px; }
+        .axis span { text-align: center; }
+        .bars { margin-top: 12px; }
+        .bar-row { display: grid; grid-template-columns: 84px 1fr 56px; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+        .bar-track { background: #EEF1F0; border-radius: 4px; height: 12px; overflow: hidden; }
+        .bar-fill { height: 100%; background: #B5432B; border-radius: 4px; transition: width 0.25s; }
+        .note { color: #6C7A77; font-size: 12px; margin-top: 14px; line-height: 1.5; max-width: 84ch; }
+      `}</style>
+
+      <header>
+        <h1>Theory test seat simulator: policy A vs policy B</h1>
+        <p className="sub">
+          One shared demand scenario, two independent policy setups. Each of the {TRIALS} simulated
+          days sends the exact same customers, preferences and cancellation fates through both,
+          so every difference on screen is the policy and nothing else.
+        </p>
+      </header>
+
+      <div className="banner">
+        <span>
+          Utilisation — <b style={{ color: "#7BC4AE" }}>A {(r.A.utilisation * 100).toFixed(1)}%</b>
+          {" · "}
+          <b style={{ color: "#9DB8DC" }}>B {(r.B.utilisation * 100).toFixed(1)}%</b>
+        </span>
+        <span className="mono">
+          {leader ? `${leader} leads by ${Math.abs(gap).toFixed(1)} pts` : "dead heat"}
+        </span>
+      </div>
+
+      <div className="grid">
+        <div>
+          <div className="panel">
+            <h2>Shared demand scenario</h2>
+            <Slider label="Seats" value={seats} onChange={setSeats} min={10} max={60} />
+            <Slider label="Booking attempts / day" value={demand} onChange={setDemand} min={50} max={500} step={10} />
+            <Slider label="2-hour share" value={twoHourShare} onChange={setTwoHourShare} min={0} max={100} unit="%" />
+            <Slider label="Peak-time bias" value={peakBias} onChange={setPeakBias} min={0} max={100} unit="%" />
+            <Slider label="Last-minute share" value={lastMinuteShare} onChange={setLastMinuteShare} min={0} max={100} unit="%" />
+            <Slider label="Cancellation rate" value={cancelRate} onChange={setCancelRate} min={0} max={30} unit="%" />
+            <Slider label="Cancellations inside cutoff" value={lateCancelShare} onChange={setLateCancelShare} min={0} max={100} unit="%" />
+            <button className="reroll" onClick={() => setSeed((s) => s + 1)}>Re-run with new randomness</button>
+            <p className="note">
+              Bookings close 3 days out (tests take 3 days to generate). Cancellations before the
+              cutoff resell; inside it they become dead seat-hours: paid, empty, unsellable.
+              No refunds; bumped customers assumed refunded. Planners accept ±30 min of their
+              preference, ±2 h with the incentive; last-minute customers take anything available.
+            </p>
+          </div>
+        </div>
+
+        <div>
+          <div className="duo">
+            <div>
+              <PolicyPanel pol={polA} setPol={setPolA} label="Setup A" accent={GREEN} />
+              <Results r={r.A} seats={seats} accent={GREEN} dark={false} />
+            </div>
+            <div>
+              <PolicyPanel pol={polB} setPol={setPolB} label="Setup B" accent={BLUE} />
+              <Results r={r.B} seats={seats} accent={BLUE} dark={true} />
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
