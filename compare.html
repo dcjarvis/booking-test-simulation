@@ -767,13 +767,16 @@ function DailyHeatmap({ days, occKey, seats }) {
   );
 }
 
-function Delta({ a, b, higherIsBetter = true, fmt = (v) => v.toFixed(1) }) {
-  const diff = b - a;
-  if (Math.abs(diff) < 1e-9) return <span className="delta flat">no change</span>;
+// The difference is taken between the figures as displayed, so two panels showing the same number
+// never report a change
+function Delta({ a, b, higherIsBetter = true, digits = 1, scale = 1, unit = "" }) {
+  const shown = (v) => Number((v * scale).toFixed(digits));
+  const diff = shown(b) - shown(a);
+  if (diff === 0) return <span className="delta flat">no change</span>;
   const good = higherIsBetter ? diff > 0 : diff < 0;
   return (
     <span className={`delta ${good ? "up" : "down"}`}>
-      {diff > 0 ? "+" : ""}{fmt(diff)}
+      {diff > 0 ? "+" : ""}{diff.toFixed(digits)}{unit}
     </span>
   );
 }
@@ -801,7 +804,6 @@ function App() {
   const model2 = useMemo(() => simulateUtilisationOptimised(shared, seed), inputs);
 
   const pct = (v) => (v * 100).toFixed(1) + "%";
-  const pctPts = (v) => (v * 100).toFixed(1) + "pp";
 
   // One trial per model for each trading day in the two-week window
   const days = useMemo(() => {
@@ -823,6 +825,12 @@ function App() {
   }, inputs);
 
   const allResults = useMemo(() => days.flatMap((d) => d.results), [days]);
+
+  // Seat-hours actually sat in across the fortnight on screen, so the figure is an exact count
+  const fortnightSeatHours = useMemo(() => {
+    const total = (key) => days.reduce((a, d) => a + d[key].reduce((s, v) => s + v, 0), 0) / 2;
+    return { m1: total("occ1"), m2: total("occ2") };
+  }, [days]);
 
   const seatsSweep = useMemo(() => sweepSeats(shared, seed), inputs);
 
@@ -1035,8 +1043,8 @@ function App() {
                 <div className="v mono">{pct(model1.utilisation)}</div>
               </div>
               <div className="metric">
-                <div className="k">Sold seat-hours</div>
-                <div className="v mono">{model1.soldSeatHours.toFixed(0)}</div>
+                <div className="k">Sold seat-hours, 2 weeks</div>
+                <div className="v mono">{fortnightSeatHours.m1.toFixed(0)}</div>
               </div>
               <div className="metric">
                 <div className="k">Cancellations / day</div>
@@ -1072,37 +1080,37 @@ function App() {
               <div className="metric">
                 <div className="k">Booking success rate</div>
                 <div className="v mono">{pct(model2.successRate)}</div>
-                <div className="d"><Delta a={model1.successRate} b={model2.successRate} fmt={pctPts} /></div>
+                <div className="d"><Delta a={model1.successRate} b={model2.successRate} scale={100} unit="pp" /></div>
               </div>
               <div className="metric">
                 <div className="k">Utilisation</div>
                 <div className="v mono">{pct(model2.utilisation)}</div>
-                <div className="d"><Delta a={model1.utilisation} b={model2.utilisation} fmt={pctPts} /></div>
+                <div className="d"><Delta a={model1.utilisation} b={model2.utilisation} scale={100} unit="pp" /></div>
               </div>
               <div className="metric">
-                <div className="k">Sold seat-hours</div>
-                <div className="v mono">{model2.soldSeatHours.toFixed(0)}</div>
-                <div className="d"><Delta a={model1.soldSeatHours} b={model2.soldSeatHours} fmt={(v) => v.toFixed(0)} /></div>
+                <div className="k">Sold seat-hours, 2 weeks</div>
+                <div className="v mono">{fortnightSeatHours.m2.toFixed(0)}</div>
+                <div className="d"><Delta a={fortnightSeatHours.m1} b={fortnightSeatHours.m2} digits={0} /></div>
               </div>
               <div className="metric">
                 <div className="k">Cancellations / day</div>
                 <div className="v mono">{model2.cancellations.toFixed(0)}</div>
-                <div className="d"><Delta a={model1.cancellations} b={model2.cancellations} higherIsBetter={false} fmt={(v) => v.toFixed(0)} /></div>
+                <div className="d"><Delta a={model1.cancellations} b={model2.cancellations} higherIsBetter={false} digits={0} /></div>
               </div>
               <div className="metric">
                 <div className="k">Turned away on arrival / day</div>
                 <div className="v mono" style={{ color: model2.turnedAway > 0 ? "#B5432B" : "#172422" }}>{model2.turnedAway.toFixed(1)}</div>
-                <div className="d"><Delta a={model1.turnedAway} b={model2.turnedAway} higherIsBetter={false} fmt={(v) => v.toFixed(1)} /> · {pct(model2.turnedAwayRate)} of people who turn up</div>
+                <div className="d"><Delta a={model1.turnedAway} b={model2.turnedAway} higherIsBetter={false} /> · {pct(model2.turnedAwayRate)} of people who turn up</div>
               </div>
               <div className="metric">
                 <div className="k">1h rejections</div>
                 <div className="v mono" style={{ color: model2.rej1Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(model2.rej1Rate)}</div>
-                <div className="d"><Delta a={model1.rej1Rate} b={model2.rej1Rate} higherIsBetter={false} fmt={pctPts} /></div>
+                <div className="d"><Delta a={model1.rej1Rate} b={model2.rej1Rate} higherIsBetter={false} scale={100} unit="pp" /></div>
               </div>
               <div className="metric">
                 <div className="k">2h rejections</div>
                 <div className="v mono" style={{ color: model2.rej2Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(model2.rej2Rate)}</div>
-                <div className="d"><Delta a={model1.rej2Rate} b={model2.rej2Rate} higherIsBetter={false} fmt={pctPts} /></div>
+                <div className="d"><Delta a={model1.rej2Rate} b={model2.rej2Rate} higherIsBetter={false} scale={100} unit="pp" /></div>
               </div>
             </div>
             <h2>Seats filled per half hour, by day</h2>
