@@ -122,7 +122,7 @@ function attendance(bookings, p) {
     for (let i = b.start; i < b.start + b.dur; i++) seated[i]++;
     b.row.outcome = 'Attended';
   }
-  return { used: seated.reduce((a, v) => a + v, 0), turnedAway, turnedAwaySeatHours };
+  return { seatedOcc: seated, used: seated.reduce((a, v) => a + v, 0), turnedAway, turnedAwaySeatHours };
 }
 
 // Cancellations hand the seat back part-way through the booking window, so later customers can take
@@ -789,8 +789,10 @@ function App() {
       const t2 = runTrialUtilisationOptimised(shared, rand, d);
       out.push({
         ...bookingDay(d),
-        occ1: t1.occ,
-        occ2: t2.occ,
+        occ1: t1.seatedOcc,
+        occ2: t2.seatedOcc,
+        held1: t1.occ,
+        held2: t2.occ,
         results: [...t1.results, ...t2.results],
       });
     }
@@ -1021,8 +1023,11 @@ function App() {
                 <div className="v mono" style={{ color: model1.rej2Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(model1.rej2Rate)}</div>
               </div>
             </div>
-            <h2>Seats occupied per half hour, by day</h2>
+            <h2>Seats filled per half hour, by day</h2>
             <DailyHeatmap days={days} occKey="occ1" seats={seats} />
+            {overbook > 0 && (
+              <p className="note">People actually seated, so never above {seats}. Bookings held peak at {Math.max(...days.map((d) => Math.max(...d.held1)))} because overbooking sells {overbook} extra place{overbook === 1 ? "" : "s"} per half hour.</p>
+            )}
           </div>
         </div>
 
@@ -1067,8 +1072,11 @@ function App() {
                 <div className="d"><Delta a={model1.rej2Rate} b={model2.rej2Rate} higherIsBetter={false} fmt={pctPts} /></div>
               </div>
             </div>
-            <h2>Seats occupied per half hour, by day</h2>
+            <h2>Seats filled per half hour, by day</h2>
             <DailyHeatmap days={days} occKey="occ2" seats={seats} />
+            {overbook > 0 && (
+              <p className="note">People actually seated, so never above {seats}. Bookings held peak at {Math.max(...days.map((d) => Math.max(...d.held2)))} because overbooking sells {overbook} extra place{overbook === 1 ? "" : "s"} per half hour.</p>
+            )}
           </div>
         </div>
       </div>
