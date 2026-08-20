@@ -279,6 +279,7 @@ function simulateFlowOptimised(p, seed) {
     soldSeatHours: used / TRIALS / 2,
     rej1Rate: req1 ? rej1 / req1 : 0,
     rej2Rate: req2 ? rej2 / req2 : 0,
+    successRate: req1 + req2 ? 1 - (rej1 + rej2) / (req1 + req2) : 0,
     results: allResults,
   };
 }
@@ -376,6 +377,7 @@ function simulateUtilisationOptimised(p, seed) {
     soldSeatHours: used / TRIALS / 2,
     rej1Rate: req1 ? rej1 / req1 : 0,
     rej2Rate: req2 ? rej2 / req2 : 0,
+    successRate: req1 + req2 ? 1 - (rej1 + rej2) / (req1 + req2) : 0,
     results: allResults,
   };
 }
@@ -755,6 +757,10 @@ function App() {
           <div className="panel">
             <div className="metrics">
               <div className="metric">
+                <div className="k">Booking success rate</div>
+                <div className="v mono">{pct(model1.successRate)}</div>
+              </div>
+              <div className="metric">
                 <div className="k">Utilisation</div>
                 <div className="v mono">{pct(model1.utilisation)}</div>
               </div>
@@ -781,6 +787,11 @@ function App() {
           <p className="colnote">No 50/50 stream constraint. Bookings are accepted based on available capacity and the algorithm tries to maximise utilisation. The hour/half-hour mix can flex based on demand.</p>
           <div className="panel">
             <div className="metrics">
+              <div className="metric">
+                <div className="k">Booking success rate</div>
+                <div className="v mono">{pct(model2.successRate)}</div>
+                <div className="d"><Delta a={model1.successRate} b={model2.successRate} fmt={pctPts} /></div>
+              </div>
               <div className="metric">
                 <div className="k">Utilisation</div>
                 <div className="v mono">{pct(model2.utilisation)}</div>
@@ -810,8 +821,9 @@ function App() {
 
       <div style={{ maxWidth: 1320, margin: "18px auto 0" }}>
         <p className="note">
-          Deltas are Model 2 minus Model 1, coloured green when the change is favourable
-          (higher utilisation, fewer rejections) and orange when unfavourable. Because both columns
+          Booking success rate is the customer-side efficiency measure: accepted requests as a share of
+          all requests made, across both durations. Deltas are Model 2 minus Model 1, coloured green when the change is favourable
+          (higher success rate, higher utilisation, fewer rejections) and orange when unfavourable. Because both columns
           share one random seed and the same demand/policy inputs, any difference you see comes purely
           from the different capacity allocation strategies — the 50/50 stream constraint vs flexible utilisation.
         </p>
