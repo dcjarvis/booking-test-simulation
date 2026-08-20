@@ -546,24 +546,34 @@ function Toggle({ label, on, onChange, hint }) {
   );
 }
 
-function Heatmap({ avgOcc, seats }) {
+function DailyHeatmap({ days, occKey, seats }) {
   return (
     <>
-      <div className="ledger">
-        {avgOcc.map((v, i) => {
-          const f = v / seats;
-          return (
-            <div key={i} className="cell mono"
-              style={{ background: cellColour(f), color: f > 0.55 ? "#fff" : "#172422" }}>
-              {Math.round(v)}
-            </div>
-          );
-        })}
-      </div>
-      <div className="axis mono">
-        {Array.from({ length: INTERVALS }, (_, i) => (
-          <span key={i}>{i % 2 === 0 ? timeLabel(i).replace(":00", "") : ""}</span>
-        ))}
+      {days.map((d) => (
+        <div key={d.date} className="dayrow">
+          <div className="daylabel">
+            {d.day.slice(0, 3)} <span className="mono">{d.date.slice(0, 5)}</span>
+          </div>
+          <div className="ledger compact">
+            {d[occKey].map((v, i) => {
+              const f = v / seats;
+              return (
+                <div key={i} className="cell compact mono"
+                  style={{ background: cellColour(f), color: f > 0.55 ? "#fff" : "#172422" }}>
+                  {Math.round(v)}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+      <div className="dayrow">
+        <div />
+        <div className="axis mono">
+          {Array.from({ length: INTERVALS }, (_, i) => (
+            <span key={i}>{i % 2 === 0 ? timeLabel(i).replace(":00", "") : ""}</span>
+          ))}
+        </div>
       </div>
     </>
   );
@@ -605,16 +615,24 @@ function App() {
   const pct = (v) => (v * 100).toFixed(1) + "%";
   const pctPts = (v) => (v * 100).toFixed(1) + "pp";
 
-  // Combine results from both models across two weeks of trading days
-  const allResults = useMemo(() => {
+  // One trial per model for each trading day in the two-week window
+  const days = useMemo(() => {
     const rand = mulberry32(seed);
     const out = [];
     for (let d = 0; d < SAMPLE_DAYS; d++) {
-      out.push(...runTrialFlowOptimised(shared, rand, d).results);
-      out.push(...runTrialUtilisationOptimised(shared, rand, d).results);
+      const t1 = runTrialFlowOptimised(shared, rand, d);
+      const t2 = runTrialUtilisationOptimised(shared, rand, d);
+      out.push({
+        ...bookingDay(d),
+        occ1: t1.occ,
+        occ2: t2.occ,
+        results: [...t1.results, ...t2.results],
+      });
     }
     return out;
-  }, [shared, seed]);
+  }, [seats, demand, twoHourShare, peakBias, lastMinuteShare, hourAlign, smart, reserve, seed]);
+
+  const allResults = useMemo(() => days.flatMap((d) => d.results), [days]);
 
   // Preview a few rows per model per day so the table spans the whole fortnight
   const previewRows = useMemo(() => {
@@ -722,6 +740,10 @@ function App() {
           justify-content: center; padding-bottom: 6px; font-size: 11px; font-weight: 600; }
         .axis { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; color: #6C7A77; font-size: 10px; }
         .axis span { text-align: center; }
+        .dayrow { display: grid; grid-template-columns: 78px 1fr; gap: 8px; align-items: center; }
+        .daylabel { font-size: 11px; color: #6C7A77; white-space: nowrap; }
+        .ledger.compact { margin: 2px 0; }
+        .cell.compact { aspect-ratio: auto; height: 22px; align-items: center; padding-bottom: 0; font-size: 10px; }
         .note { color: #6C7A77; font-size: 12px; margin-top: 14px; line-height: 1.5; }
         .divider { height: 1px; background: #D8DFDD; margin: 16px 0; }
         .download-btn { 
@@ -796,8 +818,8 @@ function App() {
                 <div className="v mono" style={{ color: model1.rej2Rate > 0.02 ? "#B5432B" : "#172422" }}>{pct(model1.rej2Rate)}</div>
               </div>
             </div>
-            <h2>Average seats occupied per half hour</h2>
-            <Heatmap avgOcc={model1.avgOcc} seats={seats} />
+            <h2>Seats occupied per half hour, by day</h2>
+            <DailyHeatmap days={days} occKey="occ1" seats={seats} />
           </div>
         </div>
 
@@ -832,8 +854,8 @@ function App() {
                 <div className="d"><Delta a={model1.rej2Rate} b={model2.rej2Rate} higherIsBetter={false} fmt={pctPts} /></div>
               </div>
             </div>
-            <h2>Average seats occupied per half hour</h2>
-            <Heatmap avgOcc={model2.avgOcc} seats={seats} />
+            <h2>Seats occupied per half hour, by day</h2>
+            <DailyHeatmap days={days} occKey="occ2" seats={seats} />
           </div>
         </div>
       </div>
