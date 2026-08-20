@@ -29,7 +29,7 @@
     const { useMemo, useState } = React;
 
     const INTERVALS = 16;
-    const TRIALS = 200;
+    const TRIALS = 1000;
 
     const timeLabel = (i) => {
       const h = 9 + Math.floor(i / 2);
@@ -212,7 +212,7 @@
     function App() {
       const [seats, setSeats] = useState(30);
       const [demand, setDemand] = useState(280);
-      const [twoHourShare, setTwoHourShare] = useState(35);
+      const [twoHourShare, setTwoHourShare] = useState(5);
       const [peakBias, setPeakBias] = useState(50);
       const [lastMinuteShare, setLastMinuteShare] = useState(40);
       const [hourAlign, setHourAlign] = useState(true);
