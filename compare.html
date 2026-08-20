@@ -976,19 +976,15 @@ function App() {
           <div className="toggles">
             <Toggle label="2h slots start on the hour" on={hourAlign} onChange={setHourAlign}
               tip={<span>
-                Long 2-hour tests are like big boxes on a shelf. When this is <b>on</b>, they may only start
-                at 9:00, 10:00, 11:00 and so on, so the boxes line up neatly and the small gaps that are left
-                are all the same size. When it is <b>off</b>, a 2-hour test can also start at half past, which
-                lets it slide into an odd gap, but it can also leave a stray half hour behind that nothing fits into.
+                <b>On</b>: 2-hour tests may only start at 9:00, 10:00, 11:00 and so on, so they line up neatly.
+                <b> Off</b>: they can also start at half past, which fills odd gaps but can leave a stray half
+                hour that nothing fits into.
               </span>} />
             <Toggle label="Smart placement" on={smart} onChange={setSmart}
               tip={<span>
-                This is like filling a bus. Some customers don't mind what time they come. When it is <b>on</b>,
-                we sit those customers next to people who are already in, filling up the busiest half hours first.
-                That keeps all the leftover seats together in one big lump, and a big lump is the only thing a long
-                2-hour test can fit into. When it is <b>off</b>, we just give everyone the time closest to the one
-                they asked for, which sprinkles the empty seats all over the day in little gaps that nothing fits
-                into, so we end up saying no to more people even though the seats are there.
+                Like filling a bus from the front. <b>On</b>: customers who don't mind the time go into the
+                busiest half hours first, so spare seats stay in one lump big enough for a 2-hour test.
+                <b> Off</b>: everyone gets the time nearest the one they asked for, scattering unusable gaps.
               </span>} />
           </div>
           <Slider label="Seats reserved for 2h bookings" value={reserve} onChange={setReserve} min={0} max={10} />
