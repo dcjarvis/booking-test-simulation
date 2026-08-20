@@ -129,7 +129,7 @@
 
         let pick;
         if (p.smart) {
-          let best = -1;
+          let best = -Infinity;
           for (const s of candidates) {
             let load = 0;
             for (let i = s; i < s + c.dur; i++) load += occ[i];

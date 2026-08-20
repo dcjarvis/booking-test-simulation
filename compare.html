@@ -140,7 +140,7 @@ function runTrialBasic(p, rand) {
     if (candidates.length === 0) { rej[c.dur]++; continue; }
     let pick;
     if (p.smart) {
-      let best = -1;
+      let best = -Infinity;
       for (const s of candidates) {
         let load = 0;
         for (let i = s; i < s + c.dur; i++) load += occ[i];
@@ -234,7 +234,7 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
     
     let pick;
     if (p.smart) {
-      let best = -1;
+      let best = -Infinity;
       for (const s of candidates) {
         let load = 0;
         for (let i = s; i < s + c.dur; i++) load += occ[i];
@@ -338,7 +338,7 @@ function runTrialUtilisationOptimised(p, rand, dayIndex = 0) {
     
     let pick;
     if (p.smart) {
-      let best = -1;
+      let best = -Infinity;
       for (const s of candidates) {
         let load = 0;
         for (let i = s; i < s + c.dur; i++) load += occ[i];
