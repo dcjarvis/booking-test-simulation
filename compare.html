@@ -179,7 +179,9 @@ function simulateBasic(p, seed) {
 // ---------- Model 1: Flow optimised (50/50 stream constraint) ----------
 function runTrialFlowOptimised(p, rand, dayIndex = 0) {
   const { day, date } = bookingDay(dayIndex);
-  const occ = new Array(INTERVALS).fill(0);
+  // Each stream has its own seats, so occupancy is tracked per stream
+  const occ1h = new Array(INTERVALS).fill(0);
+  const occ2h = new Array(INTERVALS).fill(0);
   const n = p.demand;
   
   // Separate capacity into two streams (handle odd seat counts)
@@ -211,6 +213,7 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
     req[c.dur]++;
     // Use stream-specific capacity (reserve applies to 1-hour bookings only)
     const cap = c.dur === 2 ? halfHourCap - p.reserve : hourCap;
+    const occ = c.dur === 2 ? occ1h : occ2h;
     const maxStart = INTERVALS - c.dur;
     
     if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
@@ -249,6 +252,7 @@ function runTrialFlowOptimised(p, rand, dayIndex = 0) {
     results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, startTime: timeLabel(pick), model: 'Flow Optimised' });
   }
   
+  const occ = occ1h.map((v, i) => v + occ2h[i]);
   const used = occ.reduce((a, c) => a + c, 0);
   return { occ, used, req, rej, results };
 }
