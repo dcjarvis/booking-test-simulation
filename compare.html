@@ -26,7 +26,7 @@ const { useMemo, useState } = React;
 
 // ---------- shared helpers ----------
 const INTERVALS = 16; // 09:00-17:00 in 30-min steps
-const TRIALS = 200;
+const TRIALS = 1000;
 const SAMPLE_DAYS = 10; // two weeks of trading days in the sample data
 const SAMPLE_PREVIEW_PER_DAY = 5;
 
@@ -584,7 +584,7 @@ function App() {
   // shared params (both models)
   const [seats, setSeats] = useState(30);
   const [demand, setDemand] = useState(280);
-  const [twoHourShare, setTwoHourShare] = useState(35);
+  const [twoHourShare, setTwoHourShare] = useState(5);
   const [peakBias, setPeakBias] = useState(50);
   const [lastMinuteShare, setLastMinuteShare] = useState(40);
   const [hourAlign, setHourAlign] = useState(true);
