@@ -540,17 +540,17 @@ function runTrialFlexOptimised(p, demand, dayIndex = 0) {
     if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
     const pref = sampleIdxFrom(weightsCache[c.dur], c.prefRoll);
 
-    // stays inside the stream's 50% share
-    const fitsShare = (s) => {
-      const occ = poolOf(s), cap = streamCap(s);
-      for (let i = s; i < s + c.dur; i++) if (occ[i] + 1 > cap) return false;
-      return true;
-    };
-    // borrows from the other stream: only the seats the room actually has are handed out
+    // only the seats the room actually has are ever handed out, whichever stream asks for them
     const fitsRoom = (s) => {
       const occ = poolOf(s), other = otherOf(s), cap = capBase - reserveNow;
       for (let i = s; i < s + c.dur; i++) if (occ[i] + other[i] + 1 > cap) return false;
       return true;
+    };
+    // also stays inside the stream's own 50% share
+    const fitsShare = (s) => {
+      const occ = poolOf(s), cap = streamCap(s);
+      for (let i = s; i < s + c.dur; i++) if (occ[i] + 1 > cap) return false;
+      return fitsRoom(s);
     };
 
     const inWindow = (s) => c.flexible || Math.abs(s - pref) <= 1;
@@ -1040,7 +1040,7 @@ function App() {
         h1 { font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
         .sub { color: #6C7A77; margin-top: 4px; max-width: 72ch; }
         .grid { max-width: 1720px; margin: 0 auto; display: grid; grid-template-columns: 300px repeat(3, 1fr); gap: 18px; align-items: start; }
-        @media (max-width: 1500px) { .grid { grid-template-columns: 300px 1fr 1fr; } }
+        @media (max-width: 1500px) { .grid { grid-template-columns: 1fr 1fr; } }
         @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
         .panel { background: #fff; border: 1px solid #D8DFDD; border-radius: 10px; padding: 18px; }
         .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #6C7A77; margin-bottom: 12px; font-weight: 600; }
