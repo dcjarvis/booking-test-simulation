@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="description" content="Compare flow optimised vs utilisation optimised booking models for theory test seats">
+<meta name="description" content="Compare flow optimised, utilisation optimised and flex optimised booking models for theory test seats">
 <meta name="theme-color" content="#0E5B4A">
-<title>Flow vs Utilisation Models — Theory Test Seats</title>
+<title>Flow vs Utilisation vs Flex Models — Theory Test Seats</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'><rect fill='%230E5B4A' width='180' height='180'/><text x='90' y='100' font-size='120' font-weight='bold' fill='white' text-anchor='middle' dominant-baseline='central'>T</text></svg>">
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -100,7 +100,7 @@ function sampleIdx(weights, rand) {
   return sampleIdxFrom(weights, rand());
 }
 
-// One day of demand, generated once and handed to both models so they face exactly the same
+// One day of demand, generated once and handed to every model so they face exactly the same
 // customers in the same order. Every random choice a customer makes (length, flexibility, preferred
 // time, whether they cancel and rebook) is drawn here, so a model that rejects or cancels more often
 // cannot pull the two simulations out of step. The spare customers back any rebooking a model triggers.
@@ -500,6 +500,131 @@ function simulateUtilisationOptimised(p, seed) {
   };
 }
 
+// ---------- Model 3: Flex optimised (50% peak intake per stream, flexes to full capacity) ----------
+// Each start-time stream is sized for a peak intake of 50% of capacity, exactly as Model 1. The
+// difference is that the split is a target rather than a wall: a customer who cannot be placed
+// inside its own stream's half may borrow whatever the other stream is not using, up to the full
+// capacity of the room. So the day keeps Model 1's tidy shape while demand is balanced, and behaves
+// like Model 2 once one stream runs hot.
+function runTrialFlexOptimised(p, demand, dayIndex = 0) {
+  const { day, date } = bookingDay(dayIndex);
+  const occOnHour = new Array(INTERVALS).fill(0);
+  const occOnHalf = new Array(INTERVALS).fill(0);
+
+  const capBase = p.seats + p.overbook;
+  const hourStartCap = Math.ceil(capBase * 0.5);
+  const halfStartCap = capBase - hourStartCap;
+
+  const ordered = [...demand.ordered];
+
+  const weightsCache = {};
+  const startsCache = { 2: validStarts(2, p.hourAlign), 4: validStarts(4, p.hourAlign) };
+  const req = { 2: 0, 4: 0 };
+  const rej = { 2: 0, 4: 0 };
+  const cancels = new CancelBook(p, demand.spare);
+
+  const results = [];
+  const booked = [];
+  let flexed = 0;
+
+  for (let k = 0; k < ordered.length; k++) {
+    cancels.releaseDue(k);
+    const c = ordered[k];
+    req[c.dur]++;
+    const poolOf = (s) => (s % 2 === 0 ? occOnHour : occOnHalf);
+    const otherOf = (s) => (s % 2 === 0 ? occOnHalf : occOnHour);
+    const reserveNow = c.dur === 2 ? p.reserve : 0;
+    const streamCap = (s) => (s % 2 === 0 ? hourStartCap : halfStartCap) - reserveNow;
+    const maxStart = INTERVALS - c.dur;
+
+    if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
+    const pref = sampleIdxFrom(weightsCache[c.dur], c.prefRoll);
+
+    // stays inside the stream's 50% share
+    const fitsShare = (s) => {
+      const occ = poolOf(s), cap = streamCap(s);
+      for (let i = s; i < s + c.dur; i++) if (occ[i] + 1 > cap) return false;
+      return true;
+    };
+    // borrows from the other stream: only the seats the room actually has are handed out
+    const fitsRoom = (s) => {
+      const occ = poolOf(s), other = otherOf(s), cap = capBase - reserveNow;
+      for (let i = s; i < s + c.dur; i++) if (occ[i] + other[i] + 1 > cap) return false;
+      return true;
+    };
+
+    const inWindow = (s) => c.flexible || Math.abs(s - pref) <= 1;
+    let candidates = startsCache[c.dur].filter((s) => inWindow(s) && fitsShare(s));
+    let borrowed = false;
+    if (candidates.length === 0) {
+      candidates = startsCache[c.dur].filter((s) => inWindow(s) && fitsRoom(s));
+      borrowed = candidates.length > 0;
+    }
+
+    if (candidates.length === 0) { rej[c.dur]++;
+      results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, outcome: 'Rejected', startTime: null, model: 'Flex Optimised' });
+      continue; }
+
+    let pick;
+    if (p.smart && c.flexible) {
+      let best = -Infinity;
+      for (const s of candidates) {
+        const occ = poolOf(s), other = otherOf(s);
+        let load = 0;
+        for (let i = s; i < s + c.dur; i++) load += occ[i] + other[i];
+        const score = load * 100 - Math.abs(s - pref);
+        if (score > best) { best = score; pick = s; }
+      }
+    } else {
+      pick = candidates.reduce((a, s) => Math.abs(s - pref) < Math.abs(a - pref) ? s : a, candidates[0]);
+    }
+
+    if (borrowed) flexed++;
+    const picked = poolOf(pick);
+    for (let i = pick; i < pick + c.dur; i++) picked[i]++;
+
+    const row = { day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, outcome: 'Attended', startTime: timeLabel(pick), model: 'Flex Optimised' };
+    results.push(row);
+    const booking = { pool: picked, start: pick, dur: c.dur, row, live: true };
+    booked.push(booking);
+    cancels.maybeCancel(k, c, booking, ordered);
+  }
+
+  cancels.releaseRemaining();
+  const occ = occOnHour.map((v, i) => v + occOnHalf[i]);
+  return { occ, ...attendance(booked, p), cancelled: cancels.count, flexed, req, rej, results };
+}
+
+function simulateFlexOptimised(p, seed) {
+  const occSum = new Array(INTERVALS).fill(0);
+  let used = 0, turnedAway = 0, turnedAwayHours = 0, cancelled = 0, seated = 0, flexed = 0, req1 = 0, req2 = 0, rej1 = 0, rej2 = 0;
+  let allResults = [];
+  for (let t = 0; t < TRIALS; t++) {
+    const r = runTrialFlexOptimised(p, buildDemand(p, demandSeed(seed, t)), t);
+    r.occ.forEach((v, i) => (occSum[i] += v));
+    used += r.used; turnedAway += r.turnedAway; turnedAwayHours += r.turnedAwaySeatHours; cancelled += r.cancelled;
+    flexed += r.flexed;
+    seated += r.results.filter((x) => x.outcome === 'Attended').length;
+    req1 += r.req[2]; req2 += r.req[4];
+    rej1 += r.rej[2]; rej2 += r.rej[4];
+    allResults = allResults.concat(r.results);
+  }
+  return {
+    avgOcc: occSum.map((v) => v / TRIALS),
+    utilisation: used / TRIALS / (p.seats * INTERVALS),
+    soldSeatHours: used / TRIALS / 2,
+    turnedAway: turnedAway / TRIALS,
+    turnedAwayRate: turnedAway + seated ? turnedAway / (turnedAway + seated) : 0,
+    turnedAwaySeatHours: turnedAwayHours / TRIALS / 2,
+    cancellations: cancelled / TRIALS,
+    flexedBookings: flexed / TRIALS,
+    rej1Rate: req1 ? rej1 / req1 : 0,
+    rej2Rate: req2 ? rej2 / req2 : 0,
+    successRate: req1 + req2 ? 1 - (rej1 + rej2) / (req1 + req2) : 0,
+    results: allResults,
+  };
+}
+
 // ---------- model B: advanced (index2.html) ----------
 function runTrialAdv(p, rand) {
   const occ = new Array(INTERVALS).fill(0);
@@ -680,7 +805,7 @@ function sweepSuccessRate(runTrial, p, seed) {
   return req ? 1 - rej / req : 0;
 }
 
-// Success rate of both models across a range of seat counts
+// Success rate of every model across a range of seat counts
 function sweepSeats(p, seed) {
   const q = p.twoHourShare / 100;
   // the 1h stream is the last to catch up, so its capacity sets the upper end of the chart
@@ -694,6 +819,7 @@ function sweepSeats(p, seed) {
       seats: m,
       s1: sweepSuccessRate(runTrialFlowOptimised, scenario, seed),
       s2: sweepSuccessRate(runTrialUtilisationOptimised, scenario, seed),
+      s3: sweepSuccessRate(runTrialFlexOptimised, scenario, seed),
     });
   }
   return points;
@@ -720,6 +846,7 @@ function SeatsChart({ points, seats }) {
       <polygon points={gapArea} fill="#0E5B4A" opacity="0.12" />
       <polyline points={line("s1")} fill="none" stroke="#8A9A96" strokeWidth="2.5" />
       <polyline points={line("s2")} fill="none" stroke="#0E5B4A" strokeWidth="2.5" />
+      <polyline points={line("s3")} fill="none" stroke="#2F6FB5" strokeWidth="2.5" strokeDasharray="6 3" />
       {seats <= maxSeats && (
         <g>
           <line x1={x(seats)} x2={x(seats)} y1={T} y2={H - B} stroke="#172422" strokeDasharray="4 3" strokeWidth="1" />
@@ -792,7 +919,7 @@ function Delta({ a, b, higherIsBetter = true, digits = 1, scale = 1, unit = "" }
 }
 
 function App() {
-  // shared params (both models)
+  // shared params (all models)
   const [seats, setSeats] = useState(30);
   const [demand, setDemand] = useState(280);
   const [twoHourShare, setTwoHourShare] = useState(5);
@@ -812,6 +939,7 @@ function App() {
 
   const model1 = useMemo(() => simulateFlowOptimised(shared, seed), inputs);
   const model2 = useMemo(() => simulateUtilisationOptimised(shared, seed), inputs);
+  const model3 = useMemo(() => simulateFlexOptimised(shared, seed), inputs);
 
   const pct = (v) => (v * 100).toFixed(1) + "%";
 
@@ -822,13 +950,16 @@ function App() {
       const demand = buildDemand(shared, demandSeed(seed, d));
       const t1 = runTrialFlowOptimised(shared, demand, d);
       const t2 = runTrialUtilisationOptimised(shared, demand, d);
+      const t3 = runTrialFlexOptimised(shared, demand, d);
       out.push({
         ...bookingDay(d),
         occ1: t1.seatedOcc,
         occ2: t2.seatedOcc,
+        occ3: t3.seatedOcc,
         held1: t1.occ,
         held2: t2.occ,
-        results: [...t1.results, ...t2.results],
+        held3: t3.occ,
+        results: [...t1.results, ...t2.results, ...t3.results],
       });
     }
     return out;
@@ -839,16 +970,20 @@ function App() {
   // Seat-hours actually sat in across the fortnight on screen, so the figure is an exact count
   const fortnightSeatHours = useMemo(() => {
     const total = (key) => days.reduce((a, d) => a + d[key].reduce((s, v) => s + v, 0), 0) / 2;
-    return { m1: total("occ1"), m2: total("occ2") };
+    return { m1: total("occ1"), m2: total("occ2"), m3: total("occ3") };
   }, [days]);
 
   const seatsSweep = useMemo(() => sweepSeats(shared, seed), inputs);
 
-  // where Model 2's lead peaks, and where it has all but closed again
-  const peakPoint = seatsSweep.reduce((a, p) => (Math.abs(p.s2 - p.s1) > Math.abs(a.s2 - a.s1) ? p : a), seatsSweep[0]);
-  const peakLeadsModel2 = peakPoint.s2 >= peakPoint.s1;
-  const currentLead = Math.round((model2.successRate - model1.successRate) * 100);
-  const closed = seatsSweep.find((p) => p.seats > peakPoint.seats && Math.abs(p.s2 - p.s1) < 0.01);
+  // where the models are furthest apart, and where they have all but converged again
+  const spread = (p) => Math.max(p.s1, p.s2, p.s3) - Math.min(p.s1, p.s2, p.s3);
+  const peakPoint = seatsSweep.reduce((a, p) => (spread(p) > spread(a) ? p : a), seatsSweep[0]);
+  const nameOf = { s1: "Model 1", s2: "Model 2", s3: "Model 3" };
+  const peakBest = ["s1", "s2", "s3"].reduce((a, k) => (peakPoint[k] > peakPoint[a] ? k : a), "s1");
+  const peakWorst = ["s1", "s2", "s3"].reduce((a, k) => (peakPoint[k] < peakPoint[a] ? k : a), "s1");
+  const currentLead = Math.round((model3.successRate - Math.max(model1.successRate, model2.successRate)) * 100);
+  const currentRunnerUp = model2.successRate >= model1.successRate ? "Model 2" : "Model 1";
+  const closed = seatsSweep.find((p) => p.seats > peakPoint.seats && spread(p) < 0.01);
   const catchUpSeats = closed ? closed.seats : seatsSweep[seatsSweep.length - 1].seats;
 
   // Preview a few rows per model per day so the table spans the whole fortnight
@@ -901,10 +1036,11 @@ function App() {
           padding: 28px 20px 48px; font-size: 14px;
         }
         .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-        header { max-width: 1320px; margin: 0 auto 22px; }
+        header { max-width: 1720px; margin: 0 auto 22px; }
         h1 { font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
         .sub { color: #6C7A77; margin-top: 4px; max-width: 72ch; }
-        .grid { max-width: 1320px; margin: 0 auto; display: grid; grid-template-columns: 300px 1fr 1fr; gap: 18px; align-items: start; }
+        .grid { max-width: 1720px; margin: 0 auto; display: grid; grid-template-columns: 300px repeat(3, 1fr); gap: 18px; align-items: start; }
+        @media (max-width: 1500px) { .grid { grid-template-columns: 300px 1fr 1fr; } }
         @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
         .panel { background: #fff; border: 1px solid #D8DFDD; border-radius: 10px; padding: 18px; }
         .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #6C7A77; margin-bottom: 12px; font-weight: 600; }
@@ -948,14 +1084,15 @@ function App() {
         .tipmark:hover .tip, .tipmark:focus .tip { opacity: 1; visibility: visible; }
         .reroll { margin-top: 6px; width: 100%; padding: 9px; border-radius: 8px; border: 1px solid #172422;
           background: #172422; color: #fff; font: inherit; cursor: pointer; }
-        .colhead { display: flex; align-items: center; justify-content: space-between; max-width: 1320px; margin: 0 auto; }
+        .colhead { display: flex; align-items: center; justify-content: space-between; max-width: 1720px; margin: 0 auto; }
         .badge { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 700;
           text-transform: uppercase; letter-spacing: 0.06em; }
         .badge.basic { background: #E7ECEA; color: #45524F; }
         .badge.flow { background: #E7ECEA; color: #45524F; }
         .badge.util { background: #0E5B4A; color: #fff; }
+        .badge.flexmodel { background: #2F6FB5; color: #fff; }
         .colnote { color: #6C7A77; font-size: 12px; margin-top: 4px; margin-bottom: 12px; max-width: 55ch; }
-        .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 16px; }
+        .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(88px, 1fr)); gap: 6px; margin-bottom: 16px; }
         .metric { background: #F7F9F8; border: 1px solid #E3E9E7; border-radius: 8px; padding: 9px 8px; text-align: center; }
         .metric .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; color: #6C7A77;
           font-weight: 600; line-height: 1.3; min-height: 26px; hyphens: none; overflow-wrap: normal; word-break: normal; }
@@ -999,12 +1136,13 @@ function App() {
       `}</style>
 
       <header>
-        <h1>Simulator comparison: Flow optimised vs Utilisation optimised</h1>
+        <h1>Simulator comparison: Flow optimised vs Utilisation optimised vs Flex optimised</h1>
         <p className="sub">
-          Same demand scenario run through both booking models side by side. Model 1 uses a 50/50 stream constraint
-          (separate fixed cohorts for hour and half-hour bookings), while Model 2 has no stream constraint and maximises
-          utilisation based on available capacity. This comparison shows whether allowing the mix to flex produces
-          materially better utilisation and fewer rejected bookings.
+          Same demand scenario run through three booking models side by side. Model 1 uses a hard 50/50 stream constraint
+          (separate fixed cohorts for hour and half-hour bookings), Model 2 has no stream constraint and maximises
+          utilisation based on available capacity, and Model 3 sits between them: each stream is planned around a peak
+          intake of 50% of capacity but borrows the other stream's unused seats, up to the full capacity of the room,
+          rather than turning anyone away.
         </p>
       </header>
 
@@ -1104,19 +1242,57 @@ function App() {
             )}
           </div>
         </div>
+
+        <div>
+          <div className="colhead"><span className="badge flexmodel">Model 3: Flex optimised</span></div>
+          <p className="colnote">Same two start-time streams as Model 1, each planned around a peak intake of 50% of capacity, but the split flexes: a booking that will not fit in its own stream takes whatever seats the other stream is not using, up to the full capacity of the room.</p>
+          <div className="panel">
+            <div className="metrics">
+              <Stat label="Success rate" value={pct(model3.successRate)}
+                hint="Accepted requests as a share of all booking requests"
+                delta={<Delta a={model1.successRate} b={model3.successRate} scale={100} unit="pp" />} />
+              <Stat label="Utilisation" value={pct(model3.utilisation)}
+                hint="Seats actually sat in, as a share of all seat time in the day"
+                delta={<Delta a={model1.utilisation} b={model3.utilisation} scale={100} unit="pp" />} />
+              <Stat label="Seat hours 2wk" value={fortnightSeatHours.m3.toFixed(0)}
+                hint="Seat-hours sold across the ten trading days shown below"
+                delta={<Delta a={fortnightSeatHours.m1} b={fortnightSeatHours.m3} digits={0} />} />
+              <Stat label="Cancels / day" value={model3.cancellations.toFixed(0)}
+                hint="Bookings cancelled before the day, per day"
+                delta={<Delta a={model1.cancellations} b={model3.cancellations} higherIsBetter={false} digits={0} />} />
+              <Stat label="Turned away / day" value={model3.turnedAway.toFixed(1)} alert={model3.turnedAway > 0}
+                hint={`People who turn up and find no seat, per day — ${pct(model3.turnedAwayRate)} of people who turn up`}
+                delta={<Delta a={model1.turnedAway} b={model3.turnedAway} higherIsBetter={false} />} />
+              <Stat label="1h rejected" value={pct(model3.rej1Rate)} alert={model3.rej1Rate > 0.02}
+                hint="Share of 1-hour requests that could not be placed"
+                delta={<Delta a={model1.rej1Rate} b={model3.rej1Rate} higherIsBetter={false} scale={100} unit="pp" />} />
+              <Stat label="2h rejected" value={pct(model3.rej2Rate)} alert={model3.rej2Rate > 0.02}
+                hint="Share of 2-hour requests that could not be placed"
+                delta={<Delta a={model1.rej2Rate} b={model3.rej2Rate} higherIsBetter={false} scale={100} unit="pp" />} />
+              <Stat label="Flexed / day" value={model3.flexedBookings.toFixed(0)}
+                hint="Bookings placed only because the stream borrowed seats from the other stream, per day" />
+            </div>
+            <h2>Seats filled per half hour, by day</h2>
+            <DailyHeatmap days={days} occKey="occ3" seats={seats} />
+            {overbook > 0 && (
+              <p className="note">People actually seated, so never above {seats}. Bookings held peak at {Math.max(...days.map((d) => Math.max(...d.held3)))} because overbooking sells {overbook} extra place{overbook === 1 ? "" : "s"} per half hour.</p>
+            )}
+          </div>
+        </div>
       </div>
 
-      <div style={{ maxWidth: 1320, margin: "18px auto 0" }}>
+      <div style={{ maxWidth: 1720, margin: "18px auto 0" }}>
         <p className="note">
           Booking success rate is the customer-side efficiency measure: accepted requests as a share of
-          all requests made, across both durations. Deltas are Model 2 minus Model 1, coloured green when the change is favourable
-          (higher success rate, higher utilisation, fewer rejections) and orange when unfavourable. Because both columns
+          all requests made, across both durations. Deltas are each model minus Model 1, coloured green when the change is favourable
+          (higher success rate, higher utilisation, fewer rejections) and orange when unfavourable. Because all three columns
           share one random seed and the same demand/policy inputs, any difference you see comes purely
-          from the different capacity allocation strategies — the 50/50 stream constraint vs flexible utilisation.
+          from the different capacity allocation strategies — a hard 50/50 stream constraint, one shared pool, or a
+          50% peak intake per stream that flexes to the full room.
         </p>
       </div>
 
-      <div style={{ maxWidth: 1320, margin: "18px auto 0" }}>
+      <div style={{ maxWidth: 1720, margin: "18px auto 0" }}>
         <div className="panel">
           <h2>Which model serves more people as you add seats?</h2>
           <div className="chart-grid">
@@ -1124,21 +1300,24 @@ function App() {
               <div className="legend">
                 <span><i style={{ background: "#0E5B4A" }} /> Model 2: one shared pool of seats</span>
                 <span><i style={{ background: "#8A9A96" }} /> Model 1: seats split 50/50 into two pools</span>
+                <span><i style={{ background: "#2F6FB5" }} /> Model 3: 50/50 split that lends out spare seats</span>
               </div>
               <SeatsChart points={seatsSweep} seats={seats} />
               <p className="note" style={{ marginTop: 0 }}>
                 Each line shows how many out of every 100 people asking for a test get one, at that number of seats.
-                The shaded band between the lines is the gap between the two models.
+                The shaded band is the gap between Models 1 and 2; the dashed line is Model 3.
               </p>
             </div>
             <div className="story">
               <p>
                 Model 1 keeps two separate piles of seats: one pile only for tests that start on the hour, the
                 other only for tests that start at half past. Model 2 keeps every seat in one pile and gives a
-                free seat to whoever asks next.
+                free seat to whoever asks next. Model 3 starts from Model 1's two piles, but when one pile runs
+                out it takes from the other pile rather than saying no — so it never holds a seat empty that
+                someone in front of it could sit in.
               </p>
               <p>
-                <b>With very few seats</b> both models are full all day, so they turn away almost the same people.
+                <b>With very few seats</b> every model is full all day, so they turn away almost the same people.
                 Sharing seats does not help when there is nothing spare to share.
               </p>
               <p>
@@ -1147,20 +1326,31 @@ function App() {
                 lend any spare seat to anyone. Model 1 wins when tidy start times matter more, because everyone
                 in a pile starts together and fewer awkward half-hour gaps are left that nothing fits into.
                 The gap is biggest at about <b>{peakPoint.seats} seats</b>, where{" "}
-                <b>{peakLeadsModel2 ? "Model 2" : "Model 1"}</b> says yes to{" "}
-                {Math.round(Math.max(peakPoint.s1, peakPoint.s2) * 100)} people out of 100 and the other model only{" "}
-                {Math.round(Math.min(peakPoint.s1, peakPoint.s2) * 100)}.
+                <b>{nameOf[peakBest]}</b> says yes to{" "}
+                {Math.round(peakPoint[peakBest] * 100)} people out of 100 and <b>{nameOf[peakWorst]}</b> only{" "}
+                {Math.round(peakPoint[peakWorst] * 100)}.
+              </p>
+              <p>
+                Model 3 is the safety net between the two: it keeps the tidy 50/50 shape whenever demand for the
+                two start times is balanced, and only borrows across the split when a customer would otherwise be
+                turned away. At your current settings it does that for about{" "}
+                <b>{model3.flexedBookings.toFixed(0)} bookings a day</b>.
               </p>
               <p>
                 <b>With plenty of seats</b> the difference fades: from about <b>{catchUpSeats} seats</b> there are
-                enough seats in every pile for everyone who asks, so both models say yes to nearly everybody.
+                enough seats in every pile for everyone who asks, so every model says yes to nearly everybody.
               </p>
               <p>
                 So the split into fixed piles only matters while one pile is the bottleneck. At your current{" "}
-                {seats} seats, {currentLead === 0 ? "the two models serve about the same number of people" : (
+                {seats} seats, {currentLead === 0 ? `Model 3 serves about the same number of people as ${currentRunnerUp}` : currentLead > 0 ? (
                   <>
-                    <b>{currentLead > 0 ? "Model 2" : "Model 1"}</b> serves about <b>{Math.abs(currentLead)} more
-                    people in every 100 who ask</b>
+                    <b>Model 3</b> serves about <b>{currentLead} more people in every 100 who ask</b> than{" "}
+                    {currentRunnerUp}
+                  </>
+                ) : (
+                  <>
+                    <b>{currentRunnerUp}</b> serves about <b>{Math.abs(currentLead)} more people in every 100 who
+                    ask</b> than Model 3
                   </>
                 )}.
               </p>
@@ -1169,7 +1359,7 @@ function App() {
         </div>
       </div>
 
-      <div style={{ maxWidth: 1320, margin: "18px auto 0" }}>
+      <div style={{ maxWidth: 1720, margin: "18px auto 0" }}>
         <div className="panel">
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
             <h2>Sample data ({allResults.length.toLocaleString()} bookings over {SAMPLE_DAYS} trading days)</h2>
@@ -1192,7 +1382,7 @@ function App() {
               <tbody>
                 {previewRows.map((r, i) => (
                   <tr key={i} style={{ borderBottom: "1px solid #E3E9E7" }}>
-                    <td style={{ padding: "8px 12px", color: r.model === 'Flow Optimised' ? "#45524F" : "#0E5B4A" }}>{r.model}</td>
+                    <td style={{ padding: "8px 12px", color: r.model === 'Flow Optimised' ? "#45524F" : r.model === 'Flex Optimised' ? "#2F6FB5" : "#0E5B4A" }}>{r.model}</td>
                     <td style={{ padding: "8px 12px" }}>{r.day}</td>
                     <td style={{ padding: "8px 12px", fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" }}>{r.date}</td>
                     <td style={{ padding: "8px 12px" }}>{r.duration}</td>
