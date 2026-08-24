@@ -15,13 +15,10 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
-          import re
-
           path = Path('compare.html')
           text = path.read_text()
           start = text.index('function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {')
           end = text.index('function simulateUtilisationOptimised(p, seed) {', start)
-
           fn = r'''function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
   const { day, date } = bookingDay(dayIndex);
   const occ = new Array(INTERVALS).fill(0);
@@ -34,45 +31,32 @@ jobs:
   const cancels = new CancelBook(p, demand.spare);
   const results = [];
   const booked = [];
-
-  // Model 2 is deliberately short-horizon: choose the slot that gives the
-  // best immediate fit AND the best expected result over the next few customers.
   const LOOKAHEAD = 8;
   const FUTURE_WEIGHT = 2.5;
   const PACKING_WEIGHT = 18;
   const PREFERENCE_WEIGHT = 5;
   const TWO_HOUR_PROTECTION_WEIGHT = 14;
-
   const feasibleOn = (state, s, dur, cap) => {
     for (let i = s; i < s + dur; i++) if (state[i] + 1 > cap) return false;
     return true;
   };
-
   const preferenceFor = (c) => {
     const maxStart = INTERVALS - c.dur;
     if (!weightsCache[c.dur]) weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
     return sampleIdxFrom(weightsCache[c.dur], c.prefRoll);
   };
-
-  // Estimate how many of the next LOOKAHEAD customers can be accommodated after
-  // this candidate is placed. This is intentionally a cheap greedy look-ahead,
-  // rather than a full tree search, so the 1000-trial simulation remains usable.
   const futureValue = (state, fromIndex) => {
     const sim = state.slice();
     let accepted = 0;
     let acceptedHours = 0;
     let protectedTwoHour = 0;
     const limit = Math.min(ordered.length, fromIndex + LOOKAHEAD);
-
     for (let j = fromIndex; j < limit; j++) {
       const future = ordered[j];
       const cap = future.dur === 2 ? capBase - p.reserve : capBase;
       const prefFuture = preferenceFor(future);
-      const candidates = startsCache[future.dur].filter((s) =>
-        feasibleOn(sim, s, future.dur, cap)
-      );
+      const candidates = startsCache[future.dur].filter((s) => feasibleOn(sim, s, future.dur, cap));
       if (!candidates.length) continue;
-
       let bestScore = -Infinity;
       let bestStart = candidates[0];
       for (const s of candidates) {
@@ -81,64 +65,37 @@ jobs:
         const packing = load * PACKING_WEIGHT;
         const preference = future.flexible ? Math.abs(s - prefFuture) * 1.5 : Math.abs(s - prefFuture) * PREFERENCE_WEIGHT;
         const score = packing - preference;
-        if (score > bestScore) {
-          bestScore = score;
-          bestStart = s;
-        }
+        if (score > bestScore) { bestScore = score; bestStart = s; }
       }
-
       for (let i = bestStart; i < bestStart + future.dur; i++) sim[i]++;
       accepted++;
       acceptedHours += future.dur;
     }
-
-    // Count remaining contiguous 2-hour opportunities: this rewards candidates
-    // that leave useful shapes for later demand rather than merely empty seats.
-    for (const s of startsCache[4]) {
-      if (feasibleOn(sim, s, 4, capBase - p.reserve)) protectedTwoHour++;
-    }
-
+    for (const s of startsCache[4]) if (feasibleOn(sim, s, 4, capBase - p.reserve)) protectedTwoHour++;
     return accepted * 100 + acceptedHours * 8 + protectedTwoHour * 3;
   };
-
   for (let k = 0; k < ordered.length; k++) {
     cancels.releaseDue(k);
     const c = ordered[k];
     req[c.dur]++;
     const cap = c.dur === 2 ? capBase - p.reserve : capBase;
-    const maxStart = INTERVALS - c.dur;
     const pref = preferenceFor(c);
-
     const feasible = (s) => feasibleOn(occ, s, c.dur, cap);
     let candidates;
-    if (c.flexible) {
-      candidates = startsCache[c.dur].filter(feasible);
-    } else {
-      candidates = startsCache[c.dur].filter((s) => Math.abs(s - pref) <= 1 && feasible(s));
-    }
-
+    if (c.flexible) candidates = startsCache[c.dur].filter(feasible);
+    else candidates = startsCache[c.dur].filter((s) => Math.abs(s - pref) <= 1 && feasible(s));
     if (!candidates.length) {
       rej[c.dur]++;
       results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, outcome: 'Rejected', startTime: null, model: 'Utilisation Optimised' });
       continue;
     }
-
     let pick = candidates[0];
     let best = -Infinity;
-
     for (const s of candidates) {
       let load = 0;
       for (let i = s; i < s + c.dur; i++) load += occ[i];
-
-      // Packing is valuable because it preserves empty periods elsewhere.
       const packingScore = load * PACKING_WEIGHT;
-
-      // Fixed-time customers get a meaningful preference penalty; flexible
-      // customers are deliberately much freer to move.
       const preferencePenalty = Math.abs(s - pref) * (c.flexible ? 1.5 : PREFERENCE_WEIGHT);
-
-      // A 1-hour booking can destroy a contiguous 2-hour opportunity. Penalise
-      // that only when it is actually relevant to a 1-hour booking.
       let twoHourPenalty = 0;
       if (c.dur === 2) {
         const before = startsCache[4].filter((x) => feasibleOn(occ, x, 4, capBase - p.reserve)).length;
@@ -147,43 +104,23 @@ jobs:
         const after = startsCache[4].filter((x) => feasibleOn(next, x, 4, capBase - p.reserve)).length;
         twoHourPenalty = Math.max(0, before - after) * TWO_HOUR_PROTECTION_WEIGHT;
       }
-
       const nextOcc = occ.slice();
       for (let i = s; i < s + c.dur; i++) nextOcc[i]++;
       const lookahead = futureValue(nextOcc, k + 1);
-
       const score = packingScore - preferencePenalty - twoHourPenalty + lookahead * FUTURE_WEIGHT;
-      if (score > best) {
-        best = score;
-        pick = s;
-      }
+      if (score > best) { best = score; pick = s; }
     }
-
     for (let i = pick; i < pick + c.dur; i++) occ[i]++;
-
-    const row = {
-      day,
-      date,
-      duration: c.dur === 2 ? '1h' : '2h',
-      flexible: c.flexible,
-      accepted: true,
-      outcome: 'Attended',
-      startTime: timeLabel(pick),
-      model: 'Utilisation Optimised'
-    };
+    const row = { day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: true, outcome: 'Attended', startTime: timeLabel(pick), model: 'Utilisation Optimised' };
     results.push(row);
-
     const booking = { pool: occ, start: pick, dur: c.dur, row, live: true };
     booked.push(booking);
     cancels.maybeCancel(k, c, booking, ordered);
   }
-
   cancels.releaseRemaining();
-
   return { occ, ...attendance(booked, p), cancelled: cancels.count, req, rej, results };
 }
 '''
-
           text = text[:start] + fn + text[end:]
           path.write_text(text)
       - name: Commit patched file and remove temporary workflow
