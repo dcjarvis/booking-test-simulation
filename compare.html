@@ -22,7 +22,7 @@ body {
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useMemo, useState } = React;
+const { useEffect, useMemo, useState } = React;
 
 // ---------- shared helpers ----------
 const INTERVALS = 16; // 09:00-17:00 in 30-min steps
@@ -31,6 +31,8 @@ const SAMPLE_DAYS = 10; // two weeks of trading days in the sample data
 const SAMPLE_PREVIEW_PER_DAY = 5;
 const SWEEP_TRIALS = 60; // lighter run per seat count, so the seats chart stays responsive
 const CENTRE_TRIALS = 200;
+// long enough that dragging a slider does not queue an estate run per step
+const KPI_DEBOUNCE_MS = 400;
 // a gap this small is inside the noise of the simulation, so it is reported as a tie
 const TIE_MARGIN = 0.005;
 const MODEL_KEYS = ["s1", "s2", "s3"];
@@ -962,31 +964,67 @@ function SeatsChart({ points, seats }) {
   );
 }
 
-// Every model at every centre, with demand scaled to the size of the room so each centre sits
-// under the same pressure as the scenario on screen rather than the same absolute queue
-function centreKpis(p, seed) {
-  const bySeats = new Map();
-  for (const c of TEST_CENTRES) {
-    if (bySeats.has(c.terminals)) continue;
-    const scenario = {
-      ...p,
-      seats: c.terminals,
-      demand: Math.max(1, Math.round((p.demand * c.terminals) / p.seats)),
-      reserve: Math.min(p.reserve, c.terminals - 1),
-      overbook: Math.min(p.overbook, c.terminals),
-    };
-    bySeats.set(c.terminals, {
-      s1: centreSuccessRate(runTrialFlowOptimised, scenario, seed),
-      s2: centreSuccessRate(runTrialUtilisationOptimised, scenario, seed),
-      s3: centreSuccessRate(runTrialFlexOptimised, scenario, seed),
-    });
-  }
+// Only a dozen distinct room sizes exist across the estate, so each one is simulated once
+const CENTRE_SIZES = [...new Set(TEST_CENTRES.map((c) => c.terminals))].sort((a, b) => a - b);
+
+// Demand is scaled to the size of the room so each centre sits under the same pressure as the
+// scenario on screen rather than the same absolute queue
+function centreScenario(p, terminals) {
+  return {
+    ...p,
+    seats: terminals,
+    demand: Math.max(1, Math.round((p.demand * terminals) / p.seats)),
+    reserve: Math.min(p.reserve, terminals - 1),
+    overbook: Math.min(p.overbook, terminals),
+  };
+}
+
+// One model at one room size is the unit of work, so no single task runs long enough to stall a click
+const KPI_JOBS = CENTRE_SIZES.flatMap((terminals) =>
+  [["s1", runTrialFlowOptimised], ["s2", runTrialUtilisationOptimised], ["s3", runTrialFlexOptimised]]
+    .map(([key, runTrial]) => ({ terminals, key, runTrial })));
+
+function centreRows(bySeats) {
   return TEST_CENTRES.map((c) => {
     const r = bySeats.get(c.terminals);
     const ranked = MODEL_KEYS.slice().sort((a, b) => r[b] - r[a]);
     const margin = r[ranked[0]] - r[ranked[1]];
     return { ...c, ...r, best: margin < TIE_MARGIN ? null : ranked[0], margin };
   });
+}
+
+// A full estate run is seconds of work, so it is debounced and then simulated one room size per
+// task: the controls keep responding, and the last complete table stays on screen until the new
+// one is ready
+function useCentreKpis(p, seed, key) {
+  const [state, setState] = useState({ key: null, rows: null, done: 0 });
+  useEffect(() => {
+    let live = true;
+    let timer = 0;
+    const bySeats = new Map();
+    let i = 0;
+    const step = () => {
+      if (!live) return;
+      const job = KPI_JOBS[i];
+      if (!bySeats.has(job.terminals)) bySeats.set(job.terminals, {});
+      bySeats.get(job.terminals)[job.key] =
+        centreSuccessRate(job.runTrial, centreScenario(p, job.terminals), seed);
+      i++;
+      if (i < KPI_JOBS.length) {
+        setState((s) => ({ ...s, done: i }));
+        timer = setTimeout(step, 0);
+        return;
+      }
+      setState({ key, rows: centreRows(bySeats), done: i });
+    };
+    setState((s) => ({ ...s, done: 0 }));
+    timer = setTimeout(step, KPI_DEBOUNCE_MS);
+    return () => { live = false; clearTimeout(timer); };
+  }, [key]);
+  return {
+    rows: state.rows,
+    progress: state.key === key ? null : Math.round((state.done / KPI_JOBS.length) * 100),
+  };
 }
 
 // Which model wins most often, by how much, and whether the size of the room changes the answer
@@ -1138,8 +1176,8 @@ function App() {
 
   const seatsSweep = useMemo(() => sweepSeats(shared, seed), inputs);
 
-  const centreRows = useMemo(() => centreKpis(shared, seed), inputs);
-  const verdict = useMemo(() => kpiVerdict(centreRows), [centreRows]);
+  const kpi = useCentreKpis(shared, seed, inputs.join("|"));
+  const verdict = useMemo(() => (kpi.rows ? kpiVerdict(kpi.rows) : null), [kpi.rows]);
 
   // where the models are furthest apart, and where they have all but converged again
   const spread = (p) => Math.max(p.s1, p.s2, p.s3) - Math.min(p.s1, p.s2, p.s3);
@@ -1284,6 +1322,8 @@ function App() {
         table.kpi tbody tr:hover { background: #F2F7F5; }
         table.kpi tbody tr.here { background: #F2F7F5; box-shadow: inset 3px 0 0 #172422; }
         .tied { color: #6C7A77; }
+        .working { margin-left: 10px; text-transform: none; letter-spacing: 0; font-weight: 500; color: #2F6FB5; }
+        .stale { opacity: 0.55; transition: opacity .15s ease; }
         .verdict { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 14px; }
         .verdict .card { background: #F7F9F8; border: 1px solid #E3E9E7; border-radius: 8px; padding: 12px 14px; }
         .verdict .card .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; color: #6C7A77; font-weight: 600; }
@@ -1470,13 +1510,20 @@ function App() {
 
       <div style={{ maxWidth: 1720, margin: "18px auto 0" }}>
         <div className="panel">
-          <h2>Best model per test centre</h2>
+          <h2>
+            Best model per test centre
+            {kpi.progress !== null && <span className="working">recalculating {kpi.progress}%</span>}
+          </h2>
+          {!verdict ? (
+            <p className="note" style={{ marginTop: 0 }}>Simulating every centre…</p>
+          ) : (
+          <div className={kpi.progress === null ? "" : "stale"}>
           <div className="verdict">
             <div className="card">
               <div className="k">Overall winner</div>
               <div className="v">{MODEL_NAMES[verdict.best]}</div>
               <div className="n">
-                {pct(verdict.means[verdict.best])} of requests accepted on average across all {centreRows.length} centres,{" "}
+                {pct(verdict.means[verdict.best])} of requests accepted on average across all {kpi.rows.length} centres,{" "}
                 {verdict.lead < TIE_MARGIN
                   ? `level with ${MODEL_NAMES[verdict.runnerUp]}`
                   : `${(verdict.lead * 100).toFixed(1)}pp ahead of ${MODEL_NAMES[verdict.runnerUp]}`}.
@@ -1505,7 +1552,9 @@ function App() {
               </div>
             ))}
           </div>
-          <CentreKpiTable rows={centreRows} centre={centre} onPick={pickCentre} />
+          <CentreKpiTable rows={kpi.rows} centre={centre} onPick={pickCentre} />
+          </div>
+          )}
           <p className="note">
             Booking success rate per model, in percent, for every centre run at its own number of terminals.
             Demand is scaled with the size of the room ({demand} requests at {seats} seats), so every centre faces the
