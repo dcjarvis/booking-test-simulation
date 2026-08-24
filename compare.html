@@ -31,6 +31,7 @@ const SAMPLE_DAYS = 10; // two weeks of trading days in the sample data
 const SAMPLE_PREVIEW_PER_DAY = 5;
 const SWEEP_TRIALS = 60; // lighter run per seat count, so the seats chart stays responsive
 const SWEEP_POINTS = 20;
+const LOOK_AHEAD_BOOKINGS = 18;
 
 const timeLabel = (i) => {
   const h = 9 + Math.floor(i / 2);
@@ -178,9 +179,8 @@ function sampleIdx(weights, rand) {
 }
 
 // One day of demand, generated once and handed to every model so they face exactly the same
-// customers in the same order. Every random choice a customer makes (length, flexibility, preferred
-// time, whether they cancel and rebook) is drawn here, so a model that rejects or cancels more often
-// cannot pull the two simulations out of step. The spare customers back any rebooking a model triggers.
+// customers in the same order. Each customer needs a duration on this date; the UI offers every
+// currently available start time, so there is no hidden preferred-time rejection.
 function buildDemand(p, seed) {
   const rand = mulberry32(seed);
   const customers = [];
@@ -195,11 +195,8 @@ function buildDemand(p, seed) {
     });
   }
   const today = customers.slice(0, p.demand);
-  const planners = today.filter((c) => !c.flexible);
-  const flex = today.filter((c) => c.flexible);
-  shuffle(planners, rand);
-  shuffle(flex, rand);
-  return { ordered: [...planners, ...flex], spare: customers.slice(p.demand) };
+  shuffle(today, rand);
+  return { ordered: today, spare: customers.slice(p.demand) };
 }
 
 function demandSeed(seed, dayIndex) {
@@ -316,12 +313,7 @@ function runTrialBasic(p, rand) {
       for (let i = s; i < s + c.dur; i++) if (occ[i] + 1 > cap) return false;
       return true;
     };
-    let candidates;
-    if (c.flexible) {
-      candidates = startsCache[c.dur].filter(feasible);
-    } else {
-      candidates = startsCache[c.dur].filter((s) => Math.abs(s - pref) <= 1 && feasible(s));
-    }
+    const candidates = startsCache[c.dur].filter(feasible);
     if (candidates.length === 0) { rej[c.dur]++; continue; }
     let pick;
     if (p.smart) {
@@ -415,21 +407,8 @@ function runTrialFlowOptimised(p, demand, dayIndex = 0) {
       results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, outcome: 'Rejected', startTime: null, model: 'Flow Optimised' });
       continue; }
     
-    let pick;
-    // people who named a time always take the nearest slot they can get; smart packing only moves
-    // customers who said they don't mind when they come
-    if (p.smart && c.flexible) {
-      let best = -Infinity;
-      for (const s of candidates) {
-        const occ = poolOf(s);
-        let load = 0;
-        for (let i = s; i < s + c.dur; i++) load += occ[i];
-        const score = load * 100 - Math.abs(s - pref);
-        if (score > best) { best = score; pick = s; }
-      }
-    } else {
-      pick = candidates.reduce((a, s) => Math.abs(s - pref) < Math.abs(a - pref) ? s : a, candidates[0]);
-    }
+    // The UI only presents valid choices, ordered from earliest to latest.
+    const pick = candidates[0];
     
     const picked = poolOf(pick);
     for (let i = pick; i < pick + c.dur; i++) picked[i]++;
@@ -527,28 +506,62 @@ function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
    * 2-hour opportunity when another slot is available.
    */
   const twoHourOpportunityCost = (start, dur) => {
-    let cost = 0;
-
     if (dur !== 2) return 0;
 
-    for (const s of startsCache[4]) {
-      let feasibleBefore = true;
-      for (let i = s; i < s + 4; i++) {
-        if (occ[i] + 1 > capBase) {
-          feasibleBefore = false;
-          break;
-        }
+    const after = occ.slice();
+    for (let i = start; i < start + dur; i++) after[i]++;
+
+    const canFitTwoHour = (occupancy, twoHourStart) => {
+      for (let i = twoHourStart; i < twoHourStart + 4; i++) {
+        if (occupancy[i] + 1 > capBase) return false;
       }
+      return true;
+    };
 
-      if (!feasibleBefore) continue;
-
-      // Would this booking overlap that currently viable 2h window?
-      const overlaps = start < s + 4 && start + dur > s;
-
-      if (overlaps) cost += 1;
+    let cost = 0;
+    for (const s of startsCache[4]) {
+      if (canFitTwoHour(occ, s) && !canFitTwoHour(after, s)) cost++;
     }
 
     return cost;
+  };
+
+  // Look ahead to the next real requests, rather than treating every possible
+  // two-hour start as equally valuable. A candidate is costly only when it
+  // removes a forthcoming two-hour customer's last feasible option.
+  const twoHourLookAheadLoss = (start, dur, upcoming) => {
+    const after = occ.slice();
+    for (let i = start; i < start + dur; i++) after[i]++;
+
+    const canPlace = (occupancy, customer) => {
+      const maxStart = INTERVALS - customer.dur;
+      if (!weightsCache[customer.dur]) {
+        weightsCache[customer.dur] = prefWeights(maxStart, p.peakBias);
+      }
+      const preferredStart = sampleIdxFrom(
+        weightsCache[customer.dur],
+        customer.prefRoll
+      );
+      return startsCache[customer.dur].some((slot) => {
+        if (!customer.flexible && Math.abs(slot - preferredStart) > 1) {
+          return false;
+        }
+        for (let i = slot; i < slot + customer.dur; i++) {
+          if (occupancy[i] + 1 > capFor(customer.dur)) return false;
+        }
+        return true;
+      });
+    };
+
+    let lostCustomers = 0;
+    for (const customer of upcoming) {
+      if (customer.dur !== 4) continue;
+      if (canPlace(occ, customer) && !canPlace(after, customer)) {
+        // A fixed-time request has fewer ways to recover than a flexible one.
+        lostCustomers += customer.flexible ? 1 : 2;
+      }
+    }
+    return lostCustomers;
   };
 
   /*
@@ -637,15 +650,31 @@ function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
       return true;
     };
 
-    let candidates;
+    const fitsWithinDay = (s, dur) => s >= 0 && s + dur <= INTERVALS;
 
-    if (c.flexible) {
-      candidates = startsCache[c.dur].filter(feasible);
-    } else {
-      candidates = startsCache[c.dur].filter(
-        (s) => Math.abs(s - pref) <= 1 && feasible(s)
-      );
-    }
+    // A two-hour booking should not turn a usable run into a lone spare
+    // half-hour immediately before or after itself: a one-hour booking can
+    // never use that isolated interval.
+    const leavesSpareHalfHour = (s, dur) => {
+      if (dur !== 4) return false;
+
+      const after = occ.slice();
+      for (let i = s; i < s + dur; i++) after[i]++;
+
+      const usableForOneHour = (i) =>
+        i >= 0 && i < INTERVALS && after[i] + 1 <= capFor(2);
+
+      const loneBefore = usableForOneHour(s - 1)
+        && !usableForOneHour(s - 2);
+      const loneAfter = usableForOneHour(s + dur)
+        && !usableForOneHour(s + dur + 1);
+
+      return loneBefore || loneAfter;
+    };
+
+    const candidates = startsCache[c.dur].filter(
+      (s) => fitsWithinDay(s, c.dur) && feasible(s)
+    );
 
     if (candidates.length === 0) {
       rej[c.dur]++;
@@ -664,78 +693,8 @@ function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
       continue;
     }
 
-    let pick = candidates[0];
-
-    if (p.smart || c.dur === 2) {
-      let best = -Infinity;
-
-      for (const s of candidates) {
-        let load = 0;
-
-        for (let i = s; i < s + c.dur; i++) {
-          load += occ[i];
-        }
-
-        /*
-         * 1. Packing:
-         *    Prefer adding a booking where seats are already occupied.
-         *    This keeps other periods available.
-         */
-        const packingScore = load * 100;
-
-        /*
-         * 2. Preference:
-         *    We still want to respect what the customer asked for.
-         */
-        const preferencePenalty = Math.abs(s - pref) * 8;
-
-        /*
-         * 3. Protect 2-hour capacity.
-         *
-         *    A 1h booking is particularly expensive if it consumes
-         *    scarce contiguous capacity. This is what the old Model 2
-         *    completely failed to account for.
-         */
-        let twoHourPenalty = 0;
-
-        if (c.dur === 2) {
-          twoHourPenalty = twoHourOpportunityCost(s, c.dur) * 12;
-        }
-
-        /*
-         * 4. Fragmentation.
-         */
-        const fragmentationPenalty =
-          fragmentationCost(s, c.dur) * 6;
-
-        /*
-         * 5. For flexible customers, strongly optimise packing.
-         *    For fixed customers, preference remains more important.
-         */
-        const flexibilityBonus =
-          c.flexible ? load * 20 : 0;
-
-        const score =
-          packingScore
-          + flexibilityBonus
-          - preferencePenalty
-          - twoHourPenalty
-          - fragmentationPenalty;
-
-        if (score > best) {
-          best = score;
-          pick = s;
-        }
-      }
-    } else {
-      pick = candidates.reduce(
-        (a, s) =>
-          Math.abs(s - pref) < Math.abs(a - pref)
-            ? s
-            : a,
-        candidates[0]
-      );
-    }
+    // A shared pool exposes every feasible option in chronological order.
+    const pick = candidates[0];
 
     for (let i = pick; i < pick + c.dur; i++) {
       occ[i]++;
@@ -864,11 +823,10 @@ function runTrialFlexOptimised(p, demand, dayIndex = 0) {
       return fitsRoom(s);
     };
 
-    const inWindow = (s) => c.flexible || Math.abs(s - pref) <= 1;
-    let candidates = startsCache[c.dur].filter((s) => inWindow(s) && fitsShare(s));
+    let candidates = startsCache[c.dur].filter(fitsShare);
     let borrowed = false;
     if (candidates.length === 0) {
-      candidates = startsCache[c.dur].filter((s) => inWindow(s) && fitsRoom(s));
+      candidates = startsCache[c.dur].filter(fitsRoom);
       borrowed = candidates.length > 0;
     }
 
@@ -876,19 +834,7 @@ function runTrialFlexOptimised(p, demand, dayIndex = 0) {
       results.push({ day, date, duration: c.dur === 2 ? '1h' : '2h', flexible: c.flexible, accepted: false, outcome: 'Rejected', startTime: null, model: 'Flex Optimised' });
       continue; }
 
-    let pick;
-    if (p.smart && c.flexible) {
-      let best = -Infinity;
-      for (const s of candidates) {
-        const occ = poolOf(s), other = otherOf(s);
-        let load = 0;
-        for (let i = s; i < s + c.dur; i++) load += occ[i] + other[i];
-        const score = load * 100 - Math.abs(s - pref);
-        if (score > best) { best = score; pick = s; }
-      }
-    } else {
-      pick = candidates.reduce((a, s) => Math.abs(s - pref) < Math.abs(a - pref) ? s : a, candidates[0]);
-    }
+    const pick = candidates[0];
 
     if (borrowed) flexed++;
     const picked = poolOf(pick);
@@ -1331,13 +1277,12 @@ function App() {
 
   // Convert results to CSV
   const downloadCSV = () => {
-    const headers = ['Model', 'Day', 'Date', 'Duration', 'Flexible', 'Accepted', 'Outcome', 'Start Time'];
+    const headers = ['Model', 'Day', 'Date', 'Duration', 'Offered', 'Outcome', 'Start Time'];
     const rows = allResults.map(r => [
       r.model,
       r.day,
       r.date,
       r.duration,
-      r.flexible ? 'Yes' : 'No',
       r.accepted ? 'Yes' : 'No',
       r.outcome,
       r.startTime || 'N/A'
@@ -1474,11 +1419,10 @@ function App() {
       <header>
         <h1>Simulator comparison: Flow optimised vs Utilisation optimised vs Flex optimised</h1>
         <p className="sub">
-          Same demand scenario run through three booking models side by side. Model 1 uses a hard 50/50 stream constraint
-          (separate fixed cohorts for hour and half-hour bookings), Model 2 has no stream constraint and maximises
-          utilisation based on available capacity, and Model 3 sits between them: each stream is planned around a peak
-          intake of 50% of capacity but borrows the other stream's unused seats, up to the full capacity of the room,
-          rather than turning anyone away.
+          Same date and duration demand run through three slot-offer models. Every customer sees only start times that
+          are currently available for their requested duration and takes the earliest offered slot. Model 1 keeps a hard
+          50/50 split between hour and half-hour streams; Model 2 offers from one shared pool; Model 3 starts with the
+          split but borrows unused capacity from the other stream.
         </p>
       </header>
 
@@ -1494,8 +1438,6 @@ function App() {
           <Slider label="Seats" value={seats} onChange={pickSeats} min={5} max={60} />
           <Slider label="Booking attempts / day" value={demand} onChange={setDemand} min={50} max={10000} step={10} />
           <Slider label="2-hour share of requests" value={twoHourShare} onChange={setTwoHourShare} min={0} max={100} unit="%" />
-          <Slider label="Peak-time bias" value={peakBias} onChange={setPeakBias} min={0} max={100} unit="%" />
-          <Slider label="Last-minute share" value={lastMinuteShare} onChange={setLastMinuteShare} min={0} max={100} unit="%" />
 
           <h2 style={{ marginTop: 18 }}>Shared packing policy</h2>
           <div className="toggles">
@@ -1504,12 +1446,6 @@ function App() {
                 <b>On</b>: 2-hour tests may only start at 9:00, 10:00, 11:00 and so on, so they line up neatly.
                 <b> Off</b>: they can also start at half past, which fills odd gaps but can leave a stray half
                 hour that nothing fits into.
-              </span>} />
-            <Toggle label="Smart placement" on={smart} onChange={setSmart}
-              tip={<span>
-                Like filling a bus from the front. <b>On</b>: customers who don't mind the time go into the
-                busiest half hours first, so spare seats stay in one lump big enough for a 2-hour test.
-                <b> Off</b>: everyone gets the time nearest the one they asked for, scattering unusable gaps.
               </span>} />
           </div>
           <Slider label="Seats reserved for 2h bookings" value={reserve} onChange={setReserve} min={0} max={10} />
@@ -1527,8 +1463,8 @@ function App() {
           <p className="colnote">Separate fixed cohorts by start time: bookings starting on the hour and bookings starting at :30. Each stream has a maximum intake of 50% of available capacity. Combined theoretical ceiling of 100%.</p>
           <div className="panel">
             <div className="metrics">
-              <Stat label="Success rate" value={pct(model1.successRate)}
-                hint="Accepted requests as a share of all booking requests" />
+              <Stat label="Offer rate" value={pct(model1.successRate)}
+                hint="Customers for whom at least one valid slot was available" />
               <Stat label="Utilisation" value={pct(model1.utilisation)}
                 hint="Seats actually sat in, as a share of all seat time in the day" />
               <Stat label="Seat hours 2wk" value={fortnightSeatHours.m1.toFixed(0)}
@@ -1537,10 +1473,10 @@ function App() {
                 hint="Bookings cancelled before the day, per day" />
               <Stat label="Turned away / day" value={model1.turnedAway.toFixed(1)} alert={model1.turnedAway > 0}
                 hint={`People who turn up and find no seat, per day — ${pct(model1.turnedAwayRate)} of people who turn up`} />
-              <Stat label="1h rejected" value={pct(model1.rej1Rate)} alert={model1.rej1Rate > 0.02}
-                hint="Share of 1-hour requests that could not be placed" />
-              <Stat label="2h rejected" value={pct(model1.rej2Rate)} alert={model1.rej2Rate > 0.02}
-                hint="Share of 2-hour requests that could not be placed" />
+              <Stat label="1h no offer" value={pct(model1.rej1Rate)} alert={model1.rej1Rate > 0.02}
+                hint="Share of 1-hour customers with no valid slot to show" />
+              <Stat label="2h no offer" value={pct(model1.rej2Rate)} alert={model1.rej2Rate > 0.02}
+                hint="Share of 2-hour customers with no valid slot to show" />
             </div>
             <h2>Seats filled per half hour, by day</h2>
             <DailyHeatmap days={days} occKey="occ1" seats={seats} />
@@ -1552,11 +1488,11 @@ function App() {
 
         <div>
           <div className="colhead"><span className="badge util">Model 2: Utilisation optimised</span></div>
-          <p className="colnote">No 50/50 stream constraint. Bookings are accepted based on available capacity and the algorithm tries to maximise utilisation. The hour/half-hour mix can flex based on demand.</p>
+          <p className="colnote">No stream constraint. The UI offers every available start time for the requested duration from one shared pool.</p>
           <div className="panel">
             <div className="metrics">
-              <Stat label="Success rate" value={pct(model2.successRate)}
-                hint="Accepted requests as a share of all booking requests"
+              <Stat label="Offer rate" value={pct(model2.successRate)}
+                hint="Customers for whom at least one valid slot was available"
                 delta={<Delta a={model1.successRate} b={model2.successRate} scale={100} unit="pp" />} />
               <Stat label="Utilisation" value={pct(model2.utilisation)}
                 hint="Seats actually sat in, as a share of all seat time in the day"
@@ -1570,11 +1506,11 @@ function App() {
               <Stat label="Turned away / day" value={model2.turnedAway.toFixed(1)} alert={model2.turnedAway > 0}
                 hint={`People who turn up and find no seat, per day — ${pct(model2.turnedAwayRate)} of people who turn up`}
                 delta={<Delta a={model1.turnedAway} b={model2.turnedAway} higherIsBetter={false} />} />
-              <Stat label="1h rejected" value={pct(model2.rej1Rate)} alert={model2.rej1Rate > 0.02}
-                hint="Share of 1-hour requests that could not be placed"
+              <Stat label="1h no offer" value={pct(model2.rej1Rate)} alert={model2.rej1Rate > 0.02}
+                hint="Share of 1-hour customers with no valid slot to show"
                 delta={<Delta a={model1.rej1Rate} b={model2.rej1Rate} higherIsBetter={false} scale={100} unit="pp" />} />
-              <Stat label="2h rejected" value={pct(model2.rej2Rate)} alert={model2.rej2Rate > 0.02}
-                hint="Share of 2-hour requests that could not be placed"
+              <Stat label="2h no offer" value={pct(model2.rej2Rate)} alert={model2.rej2Rate > 0.02}
+                hint="Share of 2-hour customers with no valid slot to show"
                 delta={<Delta a={model1.rej2Rate} b={model2.rej2Rate} higherIsBetter={false} scale={100} unit="pp" />} />
             </div>
             <h2>Seats filled per half hour, by day</h2>
@@ -1590,8 +1526,8 @@ function App() {
           <p className="colnote">Same two start-time streams as Model 1, each planned around a peak intake of 50% of capacity, but the split flexes: a booking that will not fit in its own stream takes whatever seats the other stream is not using, up to the full capacity of the room.</p>
           <div className="panel">
             <div className="metrics">
-              <Stat label="Success rate" value={pct(model3.successRate)}
-                hint="Accepted requests as a share of all booking requests"
+              <Stat label="Offer rate" value={pct(model3.successRate)}
+                hint="Customers for whom at least one valid slot was available"
                 delta={<Delta a={model1.successRate} b={model3.successRate} scale={100} unit="pp" />} />
               <Stat label="Utilisation" value={pct(model3.utilisation)}
                 hint="Seats actually sat in, as a share of all seat time in the day"
@@ -1605,11 +1541,11 @@ function App() {
               <Stat label="Turned away / day" value={model3.turnedAway.toFixed(1)} alert={model3.turnedAway > 0}
                 hint={`People who turn up and find no seat, per day — ${pct(model3.turnedAwayRate)} of people who turn up`}
                 delta={<Delta a={model1.turnedAway} b={model3.turnedAway} higherIsBetter={false} />} />
-              <Stat label="1h rejected" value={pct(model3.rej1Rate)} alert={model3.rej1Rate > 0.02}
-                hint="Share of 1-hour requests that could not be placed"
+              <Stat label="1h no offer" value={pct(model3.rej1Rate)} alert={model3.rej1Rate > 0.02}
+                hint="Share of 1-hour customers with no valid slot to show"
                 delta={<Delta a={model1.rej1Rate} b={model3.rej1Rate} higherIsBetter={false} scale={100} unit="pp" />} />
-              <Stat label="2h rejected" value={pct(model3.rej2Rate)} alert={model3.rej2Rate > 0.02}
-                hint="Share of 2-hour requests that could not be placed"
+              <Stat label="2h no offer" value={pct(model3.rej2Rate)} alert={model3.rej2Rate > 0.02}
+                hint="Share of 2-hour customers with no valid slot to show"
                 delta={<Delta a={model1.rej2Rate} b={model3.rej2Rate} higherIsBetter={false} scale={100} unit="pp" />} />
               <Stat label="Flexed / day" value={model3.flexedBookings.toFixed(0)}
                 hint="Bookings placed only because the stream borrowed seats from the other stream, per day" />
@@ -1625,9 +1561,9 @@ function App() {
 
       <div style={{ maxWidth: 1720, margin: "18px auto 0" }}>
         <p className="note">
-          Booking success rate is the customer-side efficiency measure: accepted requests as a share of
-          all requests made, across both durations. Deltas are each model minus Model 1, coloured green when the change is favourable
-          (higher success rate, higher utilisation, fewer rejections) and orange when unfavourable. Because all three columns
+          Offer rate is the customer-side efficiency measure: the share of customers who see at least one slot for
+          their requested duration. Deltas are each model minus Model 1, coloured green when the change is favourable
+          (higher offer rate, higher utilisation, fewer no-offer outcomes) and orange when unfavourable. Because all three columns
           share one random seed and the same demand/policy inputs, any difference you see comes purely
           from the different capacity allocation strategies — a hard 50/50 stream constraint, one shared pool, or a
           50% peak intake per stream that flexes to the full room.
@@ -1646,7 +1582,7 @@ function App() {
               </div>
               <SeatsChart points={seatsSweep} seats={seats} />
               <p className="note" style={{ marginTop: 0 }}>
-                Each line shows how many out of every 100 people asking for a test get one, at that number of seats.
+                Each line shows how many out of every 100 people asking for a test see at least one valid slot, at that number of seats.
                 The shaded band is the gap between Models 1 and 2; the dashed line is Model 3.
               </p>
             </div>
@@ -1715,8 +1651,7 @@ function App() {
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Day</th>
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Date</th>
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Duration</th>
-                  <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Flexible</th>
-                  <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Accepted</th>
+                  <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Offered</th>
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Outcome</th>
                   <th style={{ padding: "8px 12px", textAlign: "left", borderBottom: "1px solid #D8DFDD", fontWeight: 600, color: "#6C7A77" }}>Start Time</th>
                 </tr>
@@ -1728,7 +1663,6 @@ function App() {
                     <td style={{ padding: "8px 12px" }}>{r.day}</td>
                     <td style={{ padding: "8px 12px", fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" }}>{r.date}</td>
                     <td style={{ padding: "8px 12px" }}>{r.duration}</td>
-                    <td style={{ padding: "8px 12px" }}>{r.flexible ? 'Yes' : 'No'}</td>
                     <td style={{ padding: "8px 12px", color: r.accepted ? "#0E5B4A" : "#B5432B" }}>{r.accepted ? 'Yes' : 'No'}</td>
                     <td style={{ padding: "8px 12px", color: r.outcome === 'Attended' ? "#0E5B4A" : "#B5432B" }}>{r.outcome}</td>
                     <td style={{ padding: "8px 12px", fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" }}>{r.startTime || 'N/A'}</td>
