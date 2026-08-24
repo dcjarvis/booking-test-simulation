@@ -38,19 +38,30 @@ function model2FutureValue(occ, remaining, fromIndex, capacity, intervalCount, h
   }
   const remaining2h = model2CountFeasibleStarts(work, 0, intervalCount, 4, capacity);
   const remaining1h = model2CountFeasibleStarts(work, 0, intervalCount, 2, capacity);
-  return { accepted, accepted2h, preferenceSatisfied, remaining2h, remaining1h,
-    score: accepted * 100 + accepted2h * 20 + preferenceSatisfied * 5 + remaining2h * 2 + remaining1h };
+  return { accepted, accepted2h, preferenceSatisfied, remaining2h, remaining1h };
 }
 
 function model2ScoreCandidate({ occ, candidateStart, duration, capacity, remaining, nextIndex, intervalCount, preferencePenalty = 0 }) {
   const work = occ.slice();
   for (let i = candidateStart; i < candidateStart + duration; i++) work[i]++;
-  const immediateLoad = work.slice(candidateStart, candidateStart + duration).reduce((a, v) => a + v, 0);
+
+  const immediateLoad = occ.slice(candidateStart, candidateStart + duration).reduce((a, v) => a + v, 0);
   const before2h = model2CountFeasibleStarts(occ, 0, intervalCount, 4, capacity);
   const after2h = model2CountFeasibleStarts(work, 0, intervalCount, 4, capacity);
   const lostTwoHourOpportunities = Math.max(0, before2h - after2h);
   const future = model2FutureValue(work, remaining, nextIndex, capacity, intervalCount, MODEL2_LOOKAHEAD);
-  return { score: immediateLoad * 10 - preferencePenalty * 8 + future.score - lostTwoHourOpportunities * 25, future, lostTwoHourOpportunities };
+
+  // Primary objective is immediate booking quality. Look-ahead only breaks close calls;
+  // it must not sacrifice an otherwise good current booking merely to preserve hypothetical demand.
+  const preferenceScore = -preferencePenalty;
+  const packingScore = immediateLoad;
+  const futureScore = future.accepted * 0.25 + future.accepted2h * 0.10 + future.preferenceSatisfied * 0.02;
+  const preservationScore = -lostTwoHourOpportunities * 0.25;
+  const fragmentationScore = (future.remaining2h * 0.005) + (future.remaining1h * 0.001);
+  const primary = preferenceScore * 10 + packingScore;
+  const secondary = futureScore + preservationScore + fragmentationScore;
+
+  return { score: primary * 100 + secondary, primary, secondary, future, lostTwoHourOpportunities };
 }
 
 function assertModel2Capacity(occ, capacity) {
@@ -60,14 +71,9 @@ function assertModel2Capacity(occ, capacity) {
 function mulberry32(a) { return function () { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
 function shuffle(arr, rand) { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } }
 
-// Same customer construction/order shape as compare.html: 2=1h, 4=2h.
 function buildComparableDemand(p, seed) {
   const rand = mulberry32(seed), customers = [];
-  for (let k = 0; k < p.demand * 2; k++) customers.push({
-    dur: rand() < p.twoHourShare / 100 ? 4 : 2,
-    flexible: rand() < p.lastMinuteShare / 100,
-    prefRoll: rand(), cancelRoll: rand(), whenRoll: rand(), rebookRoll: rand()
-  });
+  for (let k = 0; k < p.demand * 2; k++) customers.push({ dur: rand() < p.twoHourShare / 100 ? 4 : 2, flexible: rand() < p.lastMinuteShare / 100, prefRoll: rand(), cancelRoll: rand(), whenRoll: rand(), rebookRoll: rand() });
   const today = customers.slice(0, p.demand);
   const planners = today.filter(c => !c.flexible), flex = today.filter(c => c.flexible);
   shuffle(planners, rand); shuffle(flex, rand);
