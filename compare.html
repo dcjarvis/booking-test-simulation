@@ -22,7 +22,7 @@ body {
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useMemo, useState } = React;
+const { useEffect, useMemo, useState } = React;
 
 // ---------- shared helpers ----------
 const INTERVALS = 16; // 09:00-17:00 in 30-min steps
@@ -30,6 +30,19 @@ const TRIALS = 1000;
 const SAMPLE_DAYS = 10; // two weeks of trading days in the sample data
 const SAMPLE_PREVIEW_PER_DAY = 5;
 const SWEEP_TRIALS = 60; // lighter run per seat count, so the seats chart stays responsive
+const CENTRE_TRIALS = 200;
+// long enough that dragging a slider does not queue an estate run per step
+const KPI_DEBOUNCE_MS = 400;
+// a gap this small is inside the noise of the simulation, so it is reported as a tie
+const TIE_MARGIN = 0.005;
+const MODEL_KEYS = ["s1", "s2", "s3"];
+const MODEL_NAMES = { s1: "Model 1", s2: "Model 2", s3: "Model 3" };
+const MODEL_BADGE = { s1: "flow", s2: "util", s3: "flexmodel" };
+const SIZE_BANDS = [
+  { label: "small centres (up to 11 terminals)", min: 0, max: 11 },
+  { label: "mid-sized centres (12–20)", min: 12, max: 20 },
+  { label: "large centres (21+)", min: 21, max: Infinity },
+];
 const SWEEP_POINTS = 20;
 
 const timeLabel = (i) => {
@@ -821,13 +834,6 @@ function simulateAdv(p, seed) {
 }
 
 // ---------- ui ----------
-const cellColour = (frac) => {
-  const from = [228, 236, 233], to = [14, 91, 74];
-  const f = Math.min(1, Math.max(0, frac));
-  const c = from.map((v, i) => Math.round(v + (to[i] - v) * f));
-  return `rgb(${c[0]},${c[1]},${c[2]})`;
-};
-
 function Slider({ label, value, onChange, min, max, step = 1, unit = "" }) {
   return (
     <label className="ctl">
@@ -878,6 +884,17 @@ function Toggle({ label, on, onChange, tip }) {
       {tip && <InfoTip>{tip}</InfoTip>}
     </span>
   );
+}
+
+// Per-centre figures are read side by side, so they need more trials than the sweep chart
+function centreSuccessRate(runTrial, p, seed) {
+  let req = 0, rej = 0;
+  for (let t = 0; t < CENTRE_TRIALS; t++) {
+    const r = runTrial(p, buildDemand(p, demandSeed(seed, t)));
+    req += r.req[2] + r.req[4];
+    rej += r.rej[2] + r.rej[4];
+  }
+  return req ? 1 - rej / req : 0;
 }
 
 // Booking success rate for one seat count, using fewer trials than the headline metrics
@@ -947,36 +964,121 @@ function SeatsChart({ points, seats }) {
   );
 }
 
-function DailyHeatmap({ days, occKey, seats }) {
+// Only a dozen distinct room sizes exist across the estate, so each one is simulated once
+const CENTRE_SIZES = [...new Set(TEST_CENTRES.map((c) => c.terminals))].sort((a, b) => a - b);
+
+// Demand is scaled to the size of the room so each centre sits under the same pressure as the
+// scenario on screen rather than the same absolute queue
+function centreScenario(p, terminals) {
+  return {
+    ...p,
+    seats: terminals,
+    demand: Math.max(1, Math.round((p.demand * terminals) / p.seats)),
+    reserve: Math.min(p.reserve, terminals - 1),
+    overbook: Math.min(p.overbook, terminals),
+  };
+}
+
+// One model at one room size is the unit of work, so no single task runs long enough to stall a click
+const KPI_JOBS = CENTRE_SIZES.flatMap((terminals) =>
+  [["s1", runTrialFlowOptimised], ["s2", runTrialUtilisationOptimised], ["s3", runTrialFlexOptimised]]
+    .map(([key, runTrial]) => ({ terminals, key, runTrial })));
+
+function centreRows(bySeats) {
+  return TEST_CENTRES.map((c) => {
+    const r = bySeats.get(c.terminals);
+    const ranked = MODEL_KEYS.slice().sort((a, b) => r[b] - r[a]);
+    const margin = r[ranked[0]] - r[ranked[1]];
+    return { ...c, ...r, best: margin < TIE_MARGIN ? null : ranked[0], margin };
+  });
+}
+
+// A full estate run is seconds of work, so it is debounced and then simulated one room size per
+// task: the controls keep responding, and the last complete table stays on screen until the new
+// one is ready
+function useCentreKpis(p, seed, key) {
+  const [state, setState] = useState({ key: null, rows: null, done: 0 });
+  useEffect(() => {
+    let live = true;
+    let timer = 0;
+    const bySeats = new Map();
+    let i = 0;
+    const step = () => {
+      if (!live) return;
+      const job = KPI_JOBS[i];
+      if (!bySeats.has(job.terminals)) bySeats.set(job.terminals, {});
+      bySeats.get(job.terminals)[job.key] =
+        centreSuccessRate(job.runTrial, centreScenario(p, job.terminals), seed);
+      i++;
+      if (i < KPI_JOBS.length) {
+        setState((s) => ({ ...s, done: i }));
+        timer = setTimeout(step, 0);
+        return;
+      }
+      setState({ key, rows: centreRows(bySeats), done: i });
+    };
+    setState((s) => ({ ...s, done: 0 }));
+    timer = setTimeout(step, KPI_DEBOUNCE_MS);
+    return () => { live = false; clearTimeout(timer); };
+  }, [key]);
+  return {
+    rows: state.rows,
+    progress: state.key === key ? null : Math.round((state.done / KPI_JOBS.length) * 100),
+  };
+}
+
+// Which model wins most often, by how much, and whether the size of the room changes the answer
+function kpiVerdict(rows) {
+  const wins = { s1: 0, s2: 0, s3: 0, tied: 0 };
+  for (const r of rows) wins[r.best || "tied"]++;
+  const meanOf = (set, k) => set.reduce((a, r) => a + r[k], 0) / set.length;
+  const rank = (set) => {
+    const means = { s1: meanOf(set, "s1"), s2: meanOf(set, "s2"), s3: meanOf(set, "s3") };
+    const order = MODEL_KEYS.slice().sort((a, b) => means[b] - means[a]);
+    return { means, best: order[0], runnerUp: order[1], lead: means[order[0]] - means[order[1]] };
+  };
+  const overall = rank(rows);
+  const bands = SIZE_BANDS
+    .map((b) => ({ ...b, rows: rows.filter((r) => r.terminals >= b.min && r.terminals <= b.max) }))
+    .filter((b) => b.rows.length > 0)
+    .map((b) => ({ label: b.label, count: b.rows.length, ...rank(b.rows) }));
+  return { wins, bands, ...overall };
+}
+
+function CentreKpiTable({ rows, centre, onPick }) {
   return (
-    <>
-      {days.map((d) => (
-        <div key={d.date} className="dayrow">
-          <div className="daylabel">
-            {d.day.slice(0, 3)} <span className="mono">{d.date.slice(0, 5)}</span>
-          </div>
-          <div className="ledger compact">
-            {d[occKey].map((v, i) => {
-              const f = v / seats;
-              return (
-                <div key={i} className="cell compact mono"
-                  style={{ background: cellColour(f), color: f > 0.55 ? "#fff" : "#172422" }}>
-                  {Math.round(v)}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      ))}
-      <div className="dayrow">
-        <div />
-        <div className="axis mono">
-          {Array.from({ length: INTERVALS }, (_, i) => (
-            <span key={i}>{i % 2 === 0 ? timeLabel(i).replace(":00", "") : ""}</span>
+    <div className="kpiscroll">
+      <table className="kpi">
+        <thead>
+          <tr>
+            <th>Test centre</th>
+            <th className="num">Terminals</th>
+            <th className="num">Model 1</th>
+            <th className="num">Model 2</th>
+            <th className="num">Model 3</th>
+            <th>Best model</th>
+            <th className="num">Lead</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.name} className={r.name === centre ? "here" : ""} onClick={() => onPick(r.name)}>
+              <td>{r.name}</td>
+              <td className="num mono">{r.terminals}</td>
+              {MODEL_KEYS.map((k) => (
+                <td key={k} className={`num mono ${r.best === k ? "win" : ""}`}>{(r[k] * 100).toFixed(1)}</td>
+              ))}
+              <td>
+                {r.best
+                  ? <span className={`badge ${MODEL_BADGE[r.best]}`}>{MODEL_NAMES[r.best]}</span>
+                  : <span className="tied">Tied</span>}
+              </td>
+              <td className="num mono">{r.best ? `+${(r.margin * 100).toFixed(1)}pp` : "—"}</td>
+            </tr>
           ))}
-        </div>
-      </div>
-    </>
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -1073,6 +1175,9 @@ function App() {
   }, [days]);
 
   const seatsSweep = useMemo(() => sweepSeats(shared, seed), inputs);
+
+  const kpi = useCentreKpis(shared, seed, inputs.join("|"));
+  const verdict = useMemo(() => (kpi.rows ? kpiVerdict(kpi.rows) : null), [kpi.rows]);
 
   // where the models are furthest apart, and where they have all but converged again
   const spread = (p) => Math.max(p.s1, p.s2, p.s3) - Math.min(p.s1, p.s2, p.s3);
@@ -1206,15 +1311,24 @@ function App() {
         .delta.up { color: #0E5B4A; }
         .delta.down { color: #B5432B; }
         .delta.flat { color: #9AA6A3; }
-        .ledger { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; margin: 10px 0 4px; }
-        .cell { border-radius: 4px; aspect-ratio: 1 / 1.5; display: flex; align-items: flex-end;
-          justify-content: center; padding-bottom: 6px; font-size: 11px; font-weight: 600; }
-        .axis { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; color: #6C7A77; font-size: 10px; }
-        .axis span { text-align: center; }
-        .dayrow { display: grid; grid-template-columns: 78px 1fr; gap: 8px; align-items: center; }
-        .daylabel { font-size: 11px; color: #6C7A77; white-space: nowrap; }
-        .ledger.compact { margin: 2px 0; }
-        .cell.compact { aspect-ratio: auto; height: 22px; align-items: center; padding-bottom: 0; font-size: 10px; }
+        .kpiscroll { max-height: 520px; overflow: auto; border: 1px solid #E3E9E7; border-radius: 8px; }
+        table.kpi { width: 100%; border-collapse: collapse; font-size: 13px; }
+        table.kpi th, table.kpi td { padding: 7px 10px; border-bottom: 1px solid #EDF1F0; text-align: left; white-space: nowrap; }
+        table.kpi th { position: sticky; top: 0; z-index: 1; background: #F7F9F8; font-size: 11px; text-transform: uppercase;
+          letter-spacing: 0.06em; color: #6C7A77; font-weight: 600; }
+        table.kpi td.num, table.kpi th.num { text-align: right; }
+        table.kpi td.win { font-weight: 700; color: #0E5B4A; }
+        table.kpi tbody tr { cursor: pointer; }
+        table.kpi tbody tr:hover { background: #F2F7F5; }
+        table.kpi tbody tr.here { background: #F2F7F5; box-shadow: inset 3px 0 0 #172422; }
+        .tied { color: #6C7A77; }
+        .working { margin-left: 10px; text-transform: none; letter-spacing: 0; font-weight: 500; color: #2F6FB5; }
+        .stale { opacity: 0.55; transition: opacity .15s ease; }
+        .verdict { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 14px; }
+        .verdict .card { background: #F7F9F8; border: 1px solid #E3E9E7; border-radius: 8px; padding: 12px 14px; }
+        .verdict .card .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; color: #6C7A77; font-weight: 600; }
+        .verdict .card .v { font-size: 17px; font-weight: 650; margin: 5px 0 3px; letter-spacing: -0.02em; }
+        .verdict .card .n { font-size: 12px; color: #45524F; line-height: 1.5; }
         .chart-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 22px; align-items: start; margin-top: 12px; }
         @media (max-width: 900px) { .chart-grid { grid-template-columns: 1fr; } }
         .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: #45524F; margin-bottom: 6px; }
@@ -1298,7 +1412,7 @@ function App() {
               <Stat label="Utilisation" value={pct(model1.utilisation)}
                 hint="Seats actually sat in, as a share of all seat time in the day" />
               <Stat label="Seat hours 2wk" value={fortnightSeatHours.m1.toFixed(0)}
-                hint="Seat-hours sold across the ten trading days shown below" />
+                hint="Seat-hours sold across the ten trading days in the sample below" />
               <Stat label="Cancels / day" value={model1.cancellations.toFixed(0)}
                 hint="Bookings cancelled before the day, per day" />
               <Stat label="Turned away / day" value={model1.turnedAway.toFixed(1)} alert={model1.turnedAway > 0}
@@ -1308,10 +1422,8 @@ function App() {
               <Stat label="2h rejected" value={pct(model1.rej2Rate)} alert={model1.rej2Rate > 0.02}
                 hint="Share of 2-hour requests that could not be placed" />
             </div>
-            <h2>Seats filled per half hour, by day</h2>
-            <DailyHeatmap days={days} occKey="occ1" seats={seats} />
             {overbook > 0 && (
-              <p className="note">People actually seated, so never above {seats}. Bookings held peak at {Math.max(...days.map((d) => Math.max(...d.held1)))} because overbooking sells {overbook} extra place{overbook === 1 ? "" : "s"} per half hour.</p>
+              <p className="note">Nobody is ever seated above {seats}. Bookings held peak at {Math.max(...days.map((d) => Math.max(...d.held1)))} because overbooking sells {overbook} extra place{overbook === 1 ? "" : "s"} per half hour.</p>
             )}
           </div>
         </div>
@@ -1328,7 +1440,7 @@ function App() {
                 hint="Seats actually sat in, as a share of all seat time in the day"
                 delta={<Delta a={model1.utilisation} b={model2.utilisation} scale={100} unit="pp" />} />
               <Stat label="Seat hours 2wk" value={fortnightSeatHours.m2.toFixed(0)}
-                hint="Seat-hours sold across the ten trading days shown below"
+                hint="Seat-hours sold across the ten trading days in the sample below"
                 delta={<Delta a={fortnightSeatHours.m1} b={fortnightSeatHours.m2} digits={0} />} />
               <Stat label="Cancels / day" value={model2.cancellations.toFixed(0)}
                 hint="Bookings cancelled before the day, per day"
@@ -1343,10 +1455,8 @@ function App() {
                 hint="Share of 2-hour requests that could not be placed"
                 delta={<Delta a={model1.rej2Rate} b={model2.rej2Rate} higherIsBetter={false} scale={100} unit="pp" />} />
             </div>
-            <h2>Seats filled per half hour, by day</h2>
-            <DailyHeatmap days={days} occKey="occ2" seats={seats} />
             {overbook > 0 && (
-              <p className="note">People actually seated, so never above {seats}. Bookings held peak at {Math.max(...days.map((d) => Math.max(...d.held2)))} because overbooking sells {overbook} extra place{overbook === 1 ? "" : "s"} per half hour.</p>
+              <p className="note">Nobody is ever seated above {seats}. Bookings held peak at {Math.max(...days.map((d) => Math.max(...d.held2)))} because overbooking sells {overbook} extra place{overbook === 1 ? "" : "s"} per half hour.</p>
             )}
           </div>
         </div>
@@ -1363,7 +1473,7 @@ function App() {
                 hint="Seats actually sat in, as a share of all seat time in the day"
                 delta={<Delta a={model1.utilisation} b={model3.utilisation} scale={100} unit="pp" />} />
               <Stat label="Seat hours 2wk" value={fortnightSeatHours.m3.toFixed(0)}
-                hint="Seat-hours sold across the ten trading days shown below"
+                hint="Seat-hours sold across the ten trading days in the sample below"
                 delta={<Delta a={fortnightSeatHours.m1} b={fortnightSeatHours.m3} digits={0} />} />
               <Stat label="Cancels / day" value={model3.cancellations.toFixed(0)}
                 hint="Bookings cancelled before the day, per day"
@@ -1380,10 +1490,8 @@ function App() {
               <Stat label="Flexed / day" value={model3.flexedBookings.toFixed(0)}
                 hint="Bookings placed only because the stream borrowed seats from the other stream, per day" />
             </div>
-            <h2>Seats filled per half hour, by day</h2>
-            <DailyHeatmap days={days} occKey="occ3" seats={seats} />
             {overbook > 0 && (
-              <p className="note">People actually seated, so never above {seats}. Bookings held peak at {Math.max(...days.map((d) => Math.max(...d.held3)))} because overbooking sells {overbook} extra place{overbook === 1 ? "" : "s"} per half hour.</p>
+              <p className="note">Nobody is ever seated above {seats}. Bookings held peak at {Math.max(...days.map((d) => Math.max(...d.held3)))} because overbooking sells {overbook} extra place{overbook === 1 ? "" : "s"} per half hour.</p>
             )}
           </div>
         </div>
@@ -1398,6 +1506,62 @@ function App() {
           from the different capacity allocation strategies — a hard 50/50 stream constraint, one shared pool, or a
           50% peak intake per stream that flexes to the full room.
         </p>
+      </div>
+
+      <div style={{ maxWidth: 1720, margin: "18px auto 0" }}>
+        <div className="panel">
+          <h2>
+            Best model per test centre
+            {kpi.progress !== null && <span className="working">recalculating {kpi.progress}%</span>}
+          </h2>
+          {!verdict ? (
+            <p className="note" style={{ marginTop: 0 }}>Simulating every centre…</p>
+          ) : (
+          <div className={kpi.progress === null ? "" : "stale"}>
+          <div className="verdict">
+            <div className="card">
+              <div className="k">Overall winner</div>
+              <div className="v">{MODEL_NAMES[verdict.best]}</div>
+              <div className="n">
+                {pct(verdict.means[verdict.best])} of requests accepted on average across all {kpi.rows.length} centres,{" "}
+                {verdict.lead < TIE_MARGIN
+                  ? `level with ${MODEL_NAMES[verdict.runnerUp]}`
+                  : `${(verdict.lead * 100).toFixed(1)}pp ahead of ${MODEL_NAMES[verdict.runnerUp]}`}.
+              </div>
+            </div>
+            <div className="card">
+              <div className="k">Centres won</div>
+              <div className="v mono">
+                {verdict.wins.s1} / {verdict.wins.s2} / {verdict.wins.s3}
+              </div>
+              <div className="n">
+                Model 1 / Model 2 / Model 3, with {verdict.wins.tied} centres too close to call
+                (under {(TIE_MARGIN * 100).toFixed(1)}pp apart).
+              </div>
+            </div>
+            {verdict.bands.map((b) => (
+              <div key={b.label} className="card">
+                <div className="k">{b.label}</div>
+                <div className="v">{MODEL_NAMES[b.best]}</div>
+                <div className="n">
+                  {pct(b.means[b.best])} across {b.count} centres,{" "}
+                  {b.lead < TIE_MARGIN
+                    ? `level with ${MODEL_NAMES[b.runnerUp]}`
+                    : `${(b.lead * 100).toFixed(1)}pp ahead of ${MODEL_NAMES[b.runnerUp]}`}.
+                </div>
+              </div>
+            ))}
+          </div>
+          <CentreKpiTable rows={kpi.rows} centre={centre} onPick={pickCentre} />
+          </div>
+          )}
+          <p className="note">
+            Booking success rate per model, in percent, for every centre run at its own number of terminals.
+            Demand is scaled with the size of the room ({demand} requests at {seats} seats), so every centre faces the
+            same pressure per terminal as the scenario above and only the allocation strategy differs.
+            Each figure is {CENTRE_TRIALS} simulated days. Click a row to load that centre into the controls.
+          </p>
+        </div>
       </div>
 
       <div style={{ maxWidth: 1720, margin: "18px auto 0" }}>
