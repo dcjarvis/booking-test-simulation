@@ -39,6 +39,83 @@ const timeLabel = (i) => {
 
 const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
+// Seats in the room are the terminals installed at that test centre
+const TEST_CENTRES = [
+  { name: "Aberdeen", terminals: 17 },
+  { name: "Ayr", terminals: 11 },
+  { name: "Ballymena", terminals: 11 },
+  { name: "Barrow", terminals: 5 },
+  { name: "Belfast", terminals: 17 },
+  { name: "Bethnal Green", terminals: 14 },
+  { name: "Bolton", terminals: 16 },
+  { name: "Boston", terminals: 9 },
+  { name: "Bradford", terminals: 17 },
+  { name: "Bury St Edmunds", terminals: 11 },
+  { name: "Cambridge", terminals: 16 },
+  { name: "Carlisle", terminals: 11 },
+  { name: "Chelmsford", terminals: 17 },
+  { name: "Chester", terminals: 16 },
+  { name: "Chesterfield", terminals: 11 },
+  { name: "Colchester", terminals: 11 },
+  { name: "Corby", terminals: 10 },
+  { name: "Crewe", terminals: 7 },
+  { name: "Croydon", terminals: 33 },
+  { name: "Derby", terminals: 17 },
+  { name: "Doncaster", terminals: 17 },
+  { name: "Dumbarton", terminals: 6 },
+  { name: "Dumfries", terminals: 7 },
+  { name: "Dundee", terminals: 17 },
+  { name: "Edinburgh", terminals: 17 },
+  { name: "Elgin", terminals: 7 },
+  { name: "Galashiels", terminals: 10 },
+  { name: "Glasgow", terminals: 34 },
+  { name: "Grantham", terminals: 9 },
+  { name: "Greenock", terminals: 7 },
+  { name: "Grimsby", terminals: 10 },
+  { name: "Harrogate", terminals: 11 },
+  { name: "Hertford", terminals: 16 },
+  { name: "Huddersfield", terminals: 17 },
+  { name: "Hull", terminals: 17 },
+  { name: "Ilford", terminals: 34 },
+  { name: "Inverness", terminals: 11 },
+  { name: "Ipswich", terminals: 10 },
+  { name: "Kendal", terminals: 6 },
+  { name: "Kings Lynn", terminals: 11 },
+  { name: "Leeds", terminals: 32 },
+  { name: "Leicester", terminals: 34 },
+  { name: "Lincoln", terminals: 10 },
+  { name: "Liverpool", terminals: 32 },
+  { name: "Londonderry", terminals: 11 },
+  { name: "Lowestoft", terminals: 11 },
+  { name: "Luton", terminals: 17 },
+  { name: "Manchester", terminals: 34 },
+  { name: "Middlesbrough", terminals: 16 },
+  { name: "Morden", terminals: 17 },
+  { name: "Newcastle", terminals: 17 },
+  { name: "Newry", terminals: 10 },
+  { name: "North Finchley", terminals: 33 },
+  { name: "Northallerton", terminals: 6 },
+  { name: "Northampton", terminals: 16 },
+  { name: "Norwich", terminals: 16 },
+  { name: "Nottingham", terminals: 16 },
+  { name: "Omagh", terminals: 11 },
+  { name: "Peterborough", terminals: 17 },
+  { name: "Portadown", terminals: 10 },
+  { name: "Preston", terminals: 33 },
+  { name: "Scarborough", terminals: 9 },
+  { name: "Sheffield", terminals: 17 },
+  { name: "Sidcup", terminals: 17 },
+  { name: "Southend-On-Sea", terminals: 17 },
+  { name: "Southwark", terminals: 34 },
+  { name: "Stirling", terminals: 11 },
+  { name: "Stockport", terminals: 16 },
+  { name: "Sunderland", terminals: 16 },
+  { name: "Uxbridge", terminals: 34 },
+  { name: "Watford", terminals: 17 },
+  { name: "Workington", terminals: 6 },
+  { name: "York", terminals: 11 },
+];
+
 // Each trial represents one trading day; dayIndex 0 is the next business day.
 function bookingDay(dayIndex) {
   const d = new Date();
@@ -773,6 +850,15 @@ function Slider({ label, value, onChange, min, max, step = 1, unit = "" }) {
   );
 }
 
+function Picker({ label, value, onChange, children }) {
+  return (
+    <label className="ctl">
+      <span className="ctl-row"><span>{label}</span></span>
+      <select className="picker" value={value} onChange={(e) => onChange(e.target.value)}>{children}</select>
+    </label>
+  );
+}
+
 function InfoTip({ children }) {
   return (
     <span className="tipmark" tabIndex={0} aria-label="More information">
@@ -921,6 +1007,7 @@ function Delta({ a, b, higherIsBetter = true, digits = 1, scale = 1, unit = "" }
 function App() {
   // shared params (all models)
   const [seats, setSeats] = useState(30);
+  const [centre, setCentre] = useState("");
   const [demand, setDemand] = useState(280);
   const [twoHourShare, setTwoHourShare] = useState(5);
   const [peakBias, setPeakBias] = useState(50);
@@ -942,6 +1029,18 @@ function App() {
   const model3 = useMemo(() => simulateFlexOptimised(shared, seed), inputs);
 
   const pct = (v) => (v * 100).toFixed(1) + "%";
+
+  const pickCentre = (name) => {
+    setCentre(name);
+    const found = TEST_CENTRES.find((c) => c.name === name);
+    if (found) setSeats(found.terminals);
+  };
+
+  // moving the seat count by hand no longer describes any one centre
+  const pickSeats = (v) => {
+    setSeats(v);
+    setCentre("");
+  };
 
   // One trial per model for each trading day in the two-week window
   const days = useMemo(() => {
@@ -1064,6 +1163,9 @@ function App() {
         }
         .val-unit { color: #0E5B4A; font-weight: 600; margin-left: 4px; }
         input[type=range] { width: 100%; accent-color: #0E5B4A; }
+        .picker { width: 100%; padding: 7px 8px; border: 1px solid #D8DFDD; border-radius: 6px;
+          background: #fff; color: #172422; font: inherit; }
+        .picker:focus-visible { outline: 2px solid #0E5B4A; outline-offset: 1px; }
         .toggles { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; margin-bottom: 14px; }
         .toggle { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid #D8DFDD;
           border-radius: 8px; background: #fff; cursor: pointer; font: inherit; color: inherit; text-align: left; }
@@ -1149,7 +1251,13 @@ function App() {
       <div className="grid">
         <div className="panel">
           <h2>Shared demand scenario</h2>
-          <Slider label="Seats" value={seats} onChange={setSeats} min={10} max={60} />
+          <Picker label="Test centre" value={centre} onChange={pickCentre}>
+            <option value="">Custom seat count</option>
+            {TEST_CENTRES.map((c) => (
+              <option key={c.name} value={c.name}>{c.name} — {c.terminals} terminals</option>
+            ))}
+          </Picker>
+          <Slider label="Seats" value={seats} onChange={pickSeats} min={5} max={60} />
           <Slider label="Booking attempts / day" value={demand} onChange={setDemand} min={50} max={10000} step={10} />
           <Slider label="2-hour share of requests" value={twoHourShare} onChange={setTwoHourShare} min={0} max={100} unit="%" />
           <Slider label="Peak-time bias" value={peakBias} onChange={setPeakBias} min={0} max={100} unit="%" />
@@ -1341,8 +1449,8 @@ function App() {
                 enough seats in every pile for everyone who asks, so every model says yes to nearly everybody.
               </p>
               <p>
-                So the split into fixed piles only matters while one pile is the bottleneck. At your current{" "}
-                {seats} seats, {currentLead === 0 ? `Model 3 serves about the same number of people as ${currentRunnerUp}` : currentLead > 0 ? (
+                So the split into fixed piles only matters while one pile is the bottleneck. At{" "}
+                {centre ? `${centre}'s ${seats} terminals` : `your current ${seats} seats`}, {currentLead === 0 ? `Model 3 serves about the same number of people as ${currentRunnerUp}` : currentLead > 0 ? (
                   <>
                     <b>Model 3</b> serves about <b>{currentLead} more people in every 100 who ask</b> than{" "}
                     {currentRunnerUp}
