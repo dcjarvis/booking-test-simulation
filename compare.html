@@ -527,25 +527,21 @@ function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
    * 2-hour opportunity when another slot is available.
    */
   const twoHourOpportunityCost = (start, dur) => {
-    let cost = 0;
-
     if (dur !== 2) return 0;
 
-    for (const s of startsCache[4]) {
-      let feasibleBefore = true;
-      for (let i = s; i < s + 4; i++) {
-        if (occ[i] + 1 > capBase) {
-          feasibleBefore = false;
-          break;
-        }
+    const after = occ.slice();
+    for (let i = start; i < start + dur; i++) after[i]++;
+
+    const canFitTwoHour = (occupancy, twoHourStart) => {
+      for (let i = twoHourStart; i < twoHourStart + 4; i++) {
+        if (occupancy[i] + 1 > capBase) return false;
       }
+      return true;
+    };
 
-      if (!feasibleBefore) continue;
-
-      // Would this booking overlap that currently viable 2h window?
-      const overlaps = start < s + 4 && start + dur > s;
-
-      if (overlaps) cost += 1;
+    let cost = 0;
+    for (const s of startsCache[4]) {
+      if (canFitTwoHour(occ, s) && !canFitTwoHour(after, s)) cost++;
     }
 
     return cost;
