@@ -476,8 +476,313 @@ function simulateFlowOptimised(p, seed) {
   };
 }
 
-// ---------- Model 2: Utilisation optimised (no stream constraint) ----------
+// ---------- Model 2: Utilisation optimised (no stream constraint) updated ----------
 function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
+  const { day, date } = bookingDay(dayIndex);
+  const occ = new Array(INTERVALS).fill(0);
+  const capBase = p.seats + p.overbook;
+
+  const ordered = [...demand.ordered];
+
+  const weightsCache = {};
+  const startsCache = {
+    2: validStarts(2, p.hourAlign),
+    4: validStarts(4, p.hourAlign)
+  };
+
+  const req = { 2: 0, 4: 0 };
+  const rej = { 2: 0, 4: 0 };
+
+  const cancels = new CancelBook(p, demand.spare);
+
+  const results = [];
+  const booked = [];
+
+  /*
+   * Model 2 uses one shared pool of seats.
+   *
+   * Unlike the old version, it does not simply put a customer in the
+   * nearest available slot. It looks at the opportunity cost of each
+   * candidate slot:
+   *
+   * - prefer slots that are already busy (packing)
+   * - avoid creating isolated gaps
+   * - strongly protect contiguous capacity needed by 2-hour tests
+   * - respect the customer's preferred time where possible
+   *
+   * This makes Model 2 a genuine utilisation optimiser rather than
+   * a greedy shared-capacity model.
+   */
+
+  const reserveFor = (dur) => dur === 2 ? p.reserve : 0;
+
+  // How many seats are actually available to this booking.
+  const capFor = (dur) => capBase - reserveFor(dur);
+
+  /*
+   * Count how many possible 2-hour starts would be destroyed if we
+   * occupied the candidate interval.
+   *
+   * A 1-hour booking should avoid consuming the "middle" of a scarce
+   * 2-hour opportunity when another slot is available.
+   */
+  const twoHourOpportunityCost = (start, dur) => {
+    let cost = 0;
+
+    if (dur !== 2) return 0;
+
+    for (const s of startsCache[4]) {
+      let feasibleBefore = true;
+      for (let i = s; i < s + 4; i++) {
+        if (occ[i] + 1 > capBase) {
+          feasibleBefore = false;
+          break;
+        }
+      }
+
+      if (!feasibleBefore) continue;
+
+      // Would this booking overlap that currently viable 2h window?
+      const overlaps = start < s + 4 && start + dur > s;
+
+      if (overlaps) cost += 1;
+    }
+
+    return cost;
+  };
+
+  /*
+   * Measure how "awkward" the resulting occupancy would be.
+   *
+   * Empty pockets between occupied periods are expensive because they
+   * are difficult to use later, especially for 2-hour tests.
+   */
+  const fragmentationCost = (s, dur) => {
+    const after = occ.slice();
+
+    for (let i = s; i < s + dur; i++) after[i]++;
+
+    let cost = 0;
+
+    // Penalise isolated empty intervals surrounded by occupancy.
+    for (let i = 1; i < INTERVALS - 1; i++) {
+      if (
+        after[i] === 0 &&
+        after[i - 1] > 0 &&
+        after[i + 1] > 0
+      ) {
+        cost += 3;
+      }
+    }
+
+    // Penalise small gaps that cannot accommodate a 2-hour booking.
+    let run = 0;
+    for (let i = 0; i <= INTERVALS; i++) {
+      if (i < INTERVALS && after[i] === 0) {
+        run++;
+      } else {
+        if (run > 0 && run < 4) cost += run;
+        run = 0;
+      }
+    }
+
+    return cost;
+  };
+
+  /*
+   * Look at how many 2-hour opportunities remain after placing the
+   * booking. This is the main forward-looking part of Model 2.
+   */
+  const remainingTwoHourCapacity = () => {
+    let opportunities = 0;
+
+    for (const s of startsCache[4]) {
+      let feasible = true;
+
+      for (let i = s; i < s + 4; i++) {
+        if (occ[i] + 1 > capBase) {
+          feasible = false;
+          break;
+        }
+      }
+
+      if (feasible) opportunities++;
+    }
+
+    return opportunities;
+  };
+
+  for (let k = 0; k < ordered.length; k++) {
+    cancels.releaseDue(k);
+
+    const c = ordered[k];
+    req[c.dur]++;
+
+    const cap = capFor(c.dur);
+    const maxStart = INTERVALS - c.dur;
+
+    if (!weightsCache[c.dur]) {
+      weightsCache[c.dur] = prefWeights(maxStart, p.peakBias);
+    }
+
+    const pref = sampleIdxFrom(
+      weightsCache[c.dur],
+      c.prefRoll
+    );
+
+    const feasible = (s) => {
+      for (let i = s; i < s + c.dur; i++) {
+        if (occ[i] + 1 > cap) return false;
+      }
+      return true;
+    };
+
+    let candidates;
+
+    if (c.flexible) {
+      candidates = startsCache[c.dur].filter(feasible);
+    } else {
+      candidates = startsCache[c.dur].filter(
+        (s) => Math.abs(s - pref) <= 1 && feasible(s)
+      );
+    }
+
+    if (candidates.length === 0) {
+      rej[c.dur]++;
+
+      results.push({
+        day,
+        date,
+        duration: c.dur === 2 ? '1h' : '2h',
+        flexible: c.flexible,
+        accepted: false,
+        outcome: 'Rejected',
+        startTime: null,
+        model: 'Utilisation Optimised'
+      });
+
+      continue;
+    }
+
+    let pick = candidates[0];
+
+    if (p.smart || c.dur === 2) {
+      let best = -Infinity;
+
+      for (const s of candidates) {
+        let load = 0;
+
+        for (let i = s; i < s + c.dur; i++) {
+          load += occ[i];
+        }
+
+        /*
+         * 1. Packing:
+         *    Prefer adding a booking where seats are already occupied.
+         *    This keeps other periods available.
+         */
+        const packingScore = load * 100;
+
+        /*
+         * 2. Preference:
+         *    We still want to respect what the customer asked for.
+         */
+        const preferencePenalty = Math.abs(s - pref) * 8;
+
+        /*
+         * 3. Protect 2-hour capacity.
+         *
+         *    A 1h booking is particularly expensive if it consumes
+         *    scarce contiguous capacity. This is what the old Model 2
+         *    completely failed to account for.
+         */
+        let twoHourPenalty = 0;
+
+        if (c.dur === 2) {
+          twoHourPenalty = twoHourOpportunityCost(s, c.dur) * 12;
+        }
+
+        /*
+         * 4. Fragmentation.
+         */
+        const fragmentationPenalty =
+          fragmentationCost(s, c.dur) * 6;
+
+        /*
+         * 5. For flexible customers, strongly optimise packing.
+         *    For fixed customers, preference remains more important.
+         */
+        const flexibilityBonus =
+          c.flexible ? load * 20 : 0;
+
+        const score =
+          packingScore
+          + flexibilityBonus
+          - preferencePenalty
+          - twoHourPenalty
+          - fragmentationPenalty;
+
+        if (score > best) {
+          best = score;
+          pick = s;
+        }
+      }
+    } else {
+      pick = candidates.reduce(
+        (a, s) =>
+          Math.abs(s - pref) < Math.abs(a - pref)
+            ? s
+            : a,
+        candidates[0]
+      );
+    }
+
+    for (let i = pick; i < pick + c.dur; i++) {
+      occ[i]++;
+    }
+
+    const row = {
+      day,
+      date,
+      duration: c.dur === 2 ? '1h' : '2h',
+      flexible: c.flexible,
+      accepted: true,
+      outcome: 'Attended',
+      startTime: timeLabel(pick),
+      model: 'Utilisation Optimised'
+    };
+
+    results.push(row);
+
+    const booking = {
+      pool: occ,
+      start: pick,
+      dur: c.dur,
+      row,
+      live: true
+    };
+
+    booked.push(booking);
+
+    cancels.maybeCancel(
+      k,
+      c,
+      booking,
+      ordered
+    );
+  }
+
+  cancels.releaseRemaining();
+
+  return {
+    occ,
+    ...attendance(booked, p),
+    cancelled: cancels.count,
+    req,
+    rej,
+    results
+  };
+}
   const { day, date } = bookingDay(dayIndex);
   const occ = new Array(INTERVALS).fill(0);
   const capBase = p.seats + p.overbook;
