@@ -1,0 +1,16 @@
+name: Model 2 benchmark
+on:
+  push:
+    paths:
+      - 'model2-demand-aware.js'
+      - 'benchmark-model2-vs-model1.js'
+      - '.github/workflows/model2-benchmark.yml'
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node benchmark-model2-vs-model1.js
