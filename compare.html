@@ -633,13 +633,40 @@ function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
       return true;
     };
 
+    const fitsWithinDay = (s, dur) => s >= 0 && s + dur <= INTERVALS;
+
+    // A two-hour booking should not turn a usable run into a lone spare
+    // half-hour immediately before or after itself: a one-hour booking can
+    // never use that isolated interval.
+    const leavesSpareHalfHour = (s, dur) => {
+      if (dur !== 4) return false;
+
+      const after = occ.slice();
+      for (let i = s; i < s + dur; i++) after[i]++;
+
+      const usableForOneHour = (i) =>
+        i >= 0 && i < INTERVALS && after[i] + 1 <= capFor(2);
+
+      const loneBefore = usableForOneHour(s - 1)
+        && !usableForOneHour(s - 2);
+      const loneAfter = usableForOneHour(s + dur)
+        && !usableForOneHour(s + dur + 1);
+
+      return loneBefore || loneAfter;
+    };
+
     let candidates;
 
     if (c.flexible) {
-      candidates = startsCache[c.dur].filter(feasible);
+      candidates = startsCache[c.dur].filter(
+        (s) => fitsWithinDay(s, c.dur) && feasible(s) && !leavesSpareHalfHour(s, c.dur)
+      );
     } else {
       candidates = startsCache[c.dur].filter(
-        (s) => Math.abs(s - pref) <= 1 && feasible(s)
+        (s) => Math.abs(s - pref) <= 1
+          && fitsWithinDay(s, c.dur)
+          && feasible(s)
+          && !leavesSpareHalfHour(s, c.dur)
       );
     }
 
