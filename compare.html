@@ -31,6 +31,7 @@ const SAMPLE_DAYS = 10; // two weeks of trading days in the sample data
 const SAMPLE_PREVIEW_PER_DAY = 5;
 const SWEEP_TRIALS = 60; // lighter run per seat count, so the seats chart stays responsive
 const SWEEP_POINTS = 20;
+const LOOK_AHEAD_BOOKINGS = 18;
 
 const timeLabel = (i) => {
   const h = 9 + Math.floor(i / 2);
@@ -547,6 +548,44 @@ function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
     return cost;
   };
 
+  // Look ahead to the next real requests, rather than treating every possible
+  // two-hour start as equally valuable. A candidate is costly only when it
+  // removes a forthcoming two-hour customer's last feasible option.
+  const twoHourLookAheadLoss = (start, dur, upcoming) => {
+    const after = occ.slice();
+    for (let i = start; i < start + dur; i++) after[i]++;
+
+    const canPlace = (occupancy, customer) => {
+      const maxStart = INTERVALS - customer.dur;
+      if (!weightsCache[customer.dur]) {
+        weightsCache[customer.dur] = prefWeights(maxStart, p.peakBias);
+      }
+      const preferredStart = sampleIdxFrom(
+        weightsCache[customer.dur],
+        customer.prefRoll
+      );
+      return startsCache[customer.dur].some((slot) => {
+        if (!customer.flexible && Math.abs(slot - preferredStart) > 1) {
+          return false;
+        }
+        for (let i = slot; i < slot + customer.dur; i++) {
+          if (occupancy[i] + 1 > capFor(customer.dur)) return false;
+        }
+        return true;
+      });
+    };
+
+    let lostCustomers = 0;
+    for (const customer of upcoming) {
+      if (customer.dur !== 4) continue;
+      if (canPlace(occ, customer) && !canPlace(after, customer)) {
+        // A fixed-time request has fewer ways to recover than a flexible one.
+        lostCustomers += customer.flexible ? 1 : 2;
+      }
+    }
+    return lostCustomers;
+  };
+
   /*
    * Measure how "awkward" the resulting occupancy would be.
    *
@@ -688,6 +727,7 @@ function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
     }
 
     let pick = candidates[0];
+    const upcoming = ordered.slice(k + 1, k + 1 + LOOK_AHEAD_BOOKINGS);
 
     if (p.smart || c.dur === 2) {
       let best = -Infinity;
@@ -725,6 +765,9 @@ function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
           twoHourPenalty = twoHourOpportunityCost(s, c.dur) * 12;
         }
 
+        const lookAheadPenalty =
+          twoHourLookAheadLoss(s, c.dur, upcoming) * 75;
+
         /*
          * 4. Fragmentation.
          */
@@ -743,6 +786,7 @@ function runTrialUtilisationOptimised(p, demand, dayIndex = 0) {
           + flexibilityBonus
           - preferencePenalty
           - twoHourPenalty
+          - lookAheadPenalty
           - fragmentationPenalty;
 
         if (score > best) {
